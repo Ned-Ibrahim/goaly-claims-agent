@@ -18,11 +18,12 @@ from typing import Literal
 import anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import llm as llm_mod
+from . import tts
 from .agent import Agent, state
 from .llm import AnthropicLLM, ConfigError, FakeLLM, OpenAILLM, model_names
 from .models import Session
@@ -48,6 +49,10 @@ class ChatIn(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
     channel: Literal["text", "voice"] = "text"
     heard: str | None = Field(None, max_length=2000)  # reply text the caller heard before cutting in
+
+
+class TtsIn(BaseModel):
+    text: str = Field("")
 
 
 class ResetIn(BaseModel):
@@ -146,6 +151,21 @@ def get_outbox(session_id: str):
     return [e for e in outbox if e["session_id"] == session_id]
 
 
+@app.post("/api/tts")
+def speak(body: TtsIn):
+    """Speak a reply with Kokoro. The text is never logged."""
+    text = body.text.strip()
+    if not text or len(text) > 2000:
+        raise HTTPException(400, "Text must be 1 to 2000 characters.")
+    if not tts.available():
+        raise HTTPException(503, "Server speech is not available; use the browser voice.")
+    try:
+        return Response(tts.synthesize(text), media_type="audio/wav")
+    except Exception:
+        log.error("speech synthesis failed")  # no text, no traceback (it could echo the input)
+        raise HTTPException(503, "Server speech failed; use the browser voice.")
+
+
 @app.get("/api/config")
 def config():
     provider = _provider()
@@ -157,6 +177,7 @@ def config():
         **(model_names(provider) if provider != "fake" else {}),
         "effort": os.environ.get("CLAIMS_EFFORT", "").strip() or "medium",
         "today": store.today.isoformat(),
+        "tts": "kokoro" if tts.available() else "browser",
     }
 
 

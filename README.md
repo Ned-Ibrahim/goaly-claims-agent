@@ -52,6 +52,21 @@ If on-device recognition is not available, voice stays off and the page says why
 Recognition runs on the device and replies are spoken with a local system voice, so neither the caller's audio nor the spoken reply goes to a speech service.
 Microphone access works on `localhost` without HTTPS.
 
+#### Natural voice (optional)
+
+By default the agent speaks with the browser's local voice, and its quality depends on your operating system.
+For the same natural voice everywhere, the server can speak with Kokoro, an open model that runs on your machine.
+Reply text never leaves the server.
+
+```bash
+uv sync --extra voice
+uv run python scripts/get_voice_model.py
+```
+
+The script downloads about 142 MB into `models/` and skips files you already have.
+Restart the server and the page uses Kokoro automatically.
+If the package or the files are missing, or a request fails, the browser's local voice speaks instead.
+
 ## How one caller turn flows
 
 ```text
@@ -178,6 +193,10 @@ Set these in `.env` (see `.env.example`) or the shell.
 | `CLAIMS_RESPOND_MODEL` | `claude-opus-5-5` (anthropic), required for openai | Model for the reply call |
 | `CLAIMS_EFFORT` | `medium` | Reply-call effort for anthropic: low, medium, high, xhigh, max |
 | `CLAIMS_CONSENT_SCENARIO` | `default` | `default` approves on the second check, `timeout` never approves |
+| `CLAIMS_TTS` | auto | Set to `browser` to force the browser voice even when Kokoro is installed |
+| `CLAIMS_TTS_MODEL` | `models/kokoro-v1.0.int8.onnx` | Kokoro model file |
+| `CLAIMS_TTS_VOICES` | `models/voices-v1.0.bin` | Kokoro voices file |
+| `CLAIMS_TTS_VOICE` | `af_heart` | Kokoro voice name |
 | `SOP_TODAY` | 2026-03-02 | Date deadlines are judged against, or `real` for the system clock |
 | `SOP_DATA_DIR` | `app/data/starter` | Folder with the sample JSON files |
 | `PII_PRESIDIO` | `1` | `0` turns off the optional Presidio detector (it runs only if installed with the `presidio` extra) |

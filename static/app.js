@@ -266,6 +266,7 @@ async function loadConfig() {
       badge.textContent = `${cfg.provider}: ${cfg.extract_model} reads, ${cfg.respond_model} replies` + (cfg.effort ? ` (${cfg.effort})` : "");
       if (cfg.server_has_key) $("apiKey").placeholder = "optional: server has a key";
     }
+    ttsMode = cfg.tts === "kokoro" ? "kokoro" : "browser";
     if (cfg.today) {
       $("asof").textContent = `data date ${cfg.today}`;
       $("asof").hidden = false;
@@ -281,14 +282,15 @@ const SILENCE_MS = 1300;        // end of turn after normal replies
 const SILENCE_NUMBER_MS = 2800; // longer after the agent asked for a date or number
 const ASKS_NUMBER = /\b(date of birth|birth ?date|birthday|dob|phone|number|digits|last (four|4)|ssn|id|policy|claim|zip|code)\b/i;
 
+let ttsMode = "browser"; // "kokoro" when the server can speak (config)
 let pendingHeard = null; // spoken part of an interrupted reply, sent with the next message
 function takeHeard() { const h = pendingHeard; pendingHeard = null; return h; }
 
 const Voice = {
   on: false, rec: null, stream: null, track: null,
   buffer: "", timer: null, silenceMs: SILENCE_MS,
-  utter: null, bubble: null, fullText: "", charIndex: 0, endAfter: false,
-  noVoiceSaid: false, usable: false,
+  utter: null, audio: null, audioUrl: null, bubble: null, fullText: "", charIndex: 0, endAfter: false,
+  noVoiceSaid: false, usable: false, ticket: 0, fetching: false,
 
   note(msg) { $("voiceNote").textContent = msg || ""; },
 
@@ -418,7 +420,8 @@ const Voice = {
     this.note("");
   },
 
-  get muted() { return $("pauseMic").checked && !!this.utter; },
+  get speaking() { return !!(this.utter || this.audio); },
+  get muted() { return $("pauseMic").checked && this.speaking; },
 
   applyMute() {
     if (this.track) this.track.enabled = !this.muted;
@@ -427,7 +430,7 @@ const Voice = {
   // Caller started talking: barge in on the agent (3a).
   onCallerSpeech() {
     $("mic").classList.add("heard");
-    if (this.utter && !this.muted) this.cancelSpeech(true);
+    if ((this.speaking || this.fetching) && !this.muted) this.cancelSpeech(true);
   },
 
   onResult(e) {
@@ -474,6 +477,66 @@ const Voice = {
   speak(text, bubble, ended) {
     this.silenceMs = ASKS_NUMBER.test(text) ? SILENCE_NUMBER_MS : SILENCE_MS;
     if (!this.on) return;
+    if (ttsMode === "kokoro") return this.speakServer(text, bubble, ended);
+    this.speakBrowser(text, bubble, ended);
+  },
+
+  // Server voice (Kokoro): fetch the WAV as soon as the reply arrives, play it with an Audio element.
+  // Any error falls back to the browser voice. Each call gets a ticket so a newer reply wins.
+  async speakServer(text, bubble, ended) {
+    this.cancelSpeech(false);
+    const ticket = ++this.ticket;
+    this.bubble = bubble; this.fullText = text; this.endAfter = !!ended;
+    this.fetching = true;
+    this.applyMute();
+    let url;
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error(`tts ${res.status}`);
+      url = URL.createObjectURL(await res.blob());
+      if (ticket !== this.ticket) { URL.revokeObjectURL(url); return; } // skipped or superseded
+      const a = new Audio(url);
+      const done = () => {
+        if (this.audio !== a) return;
+        this.clearAudio();
+        this.bubble = null;
+        this.applyMute();
+        if (this.endAfter) this.stop();
+      };
+      a.onended = done;
+      a.onerror = done;
+      this.audio = a; this.audioUrl = url; this.fetching = false;
+      await a.play();
+      this.applyMute();
+    } catch {
+      if (url && this.audioUrl !== url) URL.revokeObjectURL(url);
+      if (ticket !== this.ticket) return;
+      this.clearAudio();
+      this.fetching = false;
+      this.speakBrowser(text, bubble, ended);
+    }
+  },
+
+  clearAudio() {
+    const a = this.audio;
+    this.audio = null;
+    if (a) { a.onended = null; a.onerror = null; try { a.pause(); } catch { /* ignore */ } }
+    if (this.audioUrl) { URL.revokeObjectURL(this.audioUrl); this.audioUrl = null; }
+  },
+
+  // Heard part of an audio reply: cut the text at the played fraction, back to a word boundary.
+  heardFromAudio(a, text) {
+    const frac = a.duration > 0 ? Math.min(1, a.currentTime / a.duration) : 0;
+    const cut = text.slice(0, Math.floor(text.length * frac));
+    if (frac >= 1 || /\s$/.test(cut) || text[cut.length] === undefined || /\s/.test(text[cut.length])) return cut.trim();
+    return cut.replace(/\s*\S*$/, "").trim();
+  },
+
+  speakBrowser(text, bubble, ended) {
     if (!window.speechSynthesis) return;
     const voice = this.pickVoice();
     if (!voice) {
@@ -503,6 +566,20 @@ const Voice = {
 
   // Stop speech. interrupted=true records the heard part for the next message (3b, 3c).
   cancelSpeech(interrupted) {
+    const a = this.audio;
+    if (a || this.fetching) {
+      this.ticket++; // drop a fetch still in flight
+      this.fetching = false;
+      if (interrupted) pendingHeard = a ? this.heardFromAudio(a, this.fullText) : "";
+      this.clearAudio();
+      this.applyMute();
+      if (interrupted && this.bubble) {
+        this.bubble.classList.add("was-interrupted");
+        this.bubble.appendChild(el("span", "interrupted", "(interrupted)"));
+      }
+      this.bubble = null;
+      return;
+    }
     const u = this.utter;
     if (!u) { try { window.speechSynthesis?.cancel(); } catch { /* ignore */ } return; }
     this.utter = null;

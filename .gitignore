@@ -5,3 +5,4 @@ __pycache__/
 traces/
 evals/results/
 evals/runs/
+models/
