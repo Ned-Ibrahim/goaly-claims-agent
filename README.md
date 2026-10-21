@@ -74,6 +74,18 @@ The script downloads about 142 MB into `models/` and skips files you already hav
 Restart the server and the page uses Kokoro automatically.
 If the package or the files are missing, or a request fails, the browser's local voice speaks instead.
 
+#### Realtime voice (OpenAI)
+
+The "Realtime voice" button next to "Voice" starts a speech-to-speech call.
+OpenAI's `gpt-realtime` model listens, handles turn-taking and interruptions, and speaks.
+Our code stays the brain: every caller turn goes through `/api/chat` (Phases, gates, PII masking), and the model only speaks the reply the server returns.
+To use it, paste an OpenAI API key with Realtime access into the key field (or set `OPENAI_API_KEY`), then click the button and allow the microphone.
+Clicking it again, or finishing the call, closes the connection and the mic.
+Realtime and the on-device Voice mode cannot run together, and `CLAIMS_REALTIME_MODEL` overrides the model.
+
+The trade-off: the caller's raw audio goes to OpenAI's realtime model, identity details included, which the on-device Voice mode avoids.
+Verification, claim access and every reply still come from our code.
+
 ## How one caller turn flows
 
 ```text
@@ -266,6 +278,7 @@ Set these in `.env` (see `.env.example`) or the shell.
 | `CLAIMS_TTS` | auto | Set to `browser` to force the browser voice even when Kokoro is installed |
 | `CLAIMS_TTS_MODEL` | `models/kokoro-v1.0.int8.onnx` | Kokoro model file |
 | `CLAIMS_TTS_VOICES` | `models/voices-v1.0.bin` | Kokoro voices file |
+| `CLAIMS_REALTIME_MODEL` | `gpt-realtime` | Model for Realtime voice |
 | `CLAIMS_TTS_VOICE` | `af_heart` | Kokoro voice name |
 | `SOP_TODAY` | 2026-03-02 | Date deadlines are judged against, or `real` for the system clock |
 | `SOP_DATA_DIR` | `app/data/starter` | Folder with the sample JSON files |
