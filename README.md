@@ -186,6 +186,68 @@ See `evals/README.md` for the options.
 - Presidio is optional and stays off unless installed with the `presidio` extra. Without it, the parser's own patterns and the fail-closed sweep do the work.
 - When a Representative describes a claim instead of giving its number, a hint that matches one claim starts a Consent request, while a hint that matches none gets "which claim number?". That difference tells the caller whether a matching claim exists.
 
+## What we would do differently
+
+**Measure the voice loop first.**
+We built the whole pipeline and only then timed it.
+The first live call had about 10 s of silence per turn: 2.8 s waiting for the caller to stop, 6.2 s in two model calls run back to back, and 1.3 s turning the whole reply into audio.
+A voice activity detector, sentence-by-sentence streaming and a faster reply model brought the first spoken sentence down to 1.8 to 3.8 s on Claude Haiku.
+Those belong in the first design, not in a fix after the fact.
+
+**Pick the voice architecture up front, and price the privacy cost.**
+A speech-to-speech model sounds the most natural, but it hears the caller's raw audio and talks before code can check what it says.
+We kept text in the middle so identity details never reach a model, which is the right call for a claims line.
+We should still have built both versions in the first hour and compared them on real calls instead of on paper.
+
+**Use a real microphone on day one.**
+Two problems only showed up live.
+Speech recognition heard "Margaret Shin" for "Margaret Chen", and verification failed because the read-back covered digits and dates but not the name.
+A short "Got it" clip played the moment the caller stopped, which sounds odd after "Hey, how's it going?".
+The name is now read back and the clip is gone, and an hour of real calls on day one would have caught both.
+
+**Run the live evals on a schedule.**
+The 46 scripted scenarios run on a deterministic stand-in.
+The simulated-caller run (`--simulate --k 5`) works against a live model, but nothing runs it regularly, so a model regression would reach a caller before it reached us.
+
+## Using two models
+
+The agent already splits each turn across two calls: one reads the caller's message into fields, the other writes the reply.
+Two more splits would raise quality without slowing the call down.
+
+1. **A voice model in front, this controller behind it.**
+   A speech-to-speech model (OpenAI Realtime, for example) does the listening, turn-taking, interruptions and speaking, and passes every caller turn to this server as a tool call.
+   Verification, the gates and the claim data stay in code.
+   We have a working prototype of this on a separate branch; it is left out of this submission because it has not passed a full live test.
+   The cost is the one above: the voice model hears the caller's raw audio, identity details included.
+2. **A fast model for routine turns, a stronger one for hard turns.**
+   Most turns are routine: a greeting, a read-back, a status question.
+   When the controller sees a hard turn (conflicting details, strong emotion, a question about documents or deadlines), it sends that one turn to a stronger model and plays a short holding line while it works.
+   The controller already knows which turns are hard, so the routing is a code decision, not something a model has to guess.
+
+## Improving the system with a feedback loop
+
+Every call leaves a masked trace in `traces/<session>.jsonl`: the phase, each memory write, every gate result, tool call and emotion reading.
+That is enough to find the layer where a failure starts, and each layer has its own levers.
+
+| Layer | What the failure looks like | Levers to change |
+|---|---|---|
+| Channel (speech in and out) | misheard name or digits, the caller cut off mid-sentence, the agent stopped by a cough, a long silence before the reply | read-back fields, voice detector thresholds, end-of-turn wait, speech engine, streaming |
+| Controller (the SOP harness) | wrong phase change, a gate that blocks a real caller or lets a wrong one through, a detail asked for twice | gate rules, slot lifetimes, read-back rules, retry and handoff limits |
+| Model | wrong field extracted, emotion misread, a reply that fails a gate and needs a retry, a slow turn | prompt, schema, model choice, effort, examples |
+| Data and tools | claim not found, wrong document guideline, consent stuck pending | fixtures, tool contracts, timeouts |
+
+The loop has four steps.
+
+1. **Collect** every failed or slow turn from the traces, plus every call where the caller asked for a person.
+2. **Locate** the first layer where the trace goes wrong. A gate that blocked a caller whose extracted details were right points at the controller. The same block with a wrong date in the extracted fields points at the model or the channel. Rules sort the clear cases, and a model can label the rest for a person to confirm.
+3. **Change one lever** in that layer.
+4. **Prove it.** Turn the failing call into a scripted scenario, then rerun the scripted evals and the simulated caller (pass^k). Keep the change only if the new scenario passes and nothing else drops.
+
+Today's fixes went through this loop by hand.
+The "Margaret Shin" failure started in the channel: the model and the controller did exactly what they should with a wrong name, so the lever was the read-back.
+The 10 s silence came from the model layer and the channel together, so the levers were the reply model, streaming and the voice detector.
+Automating the first two steps turns each batch of calls into a ranked list of fixes, each tied to the layer and the lever that owns it.
+
 ## Configuration
 
 Set these in `.env` (see `.env.example`) or the shell.
