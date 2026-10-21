@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from . import llm as llm_mod
 from . import tts
 from .agent import Agent, state
-from .llm import AnthropicLLM, ConfigError, FakeLLM, OpenAILLM, model_names
+from .llm import DEFAULT_EFFORT, AnthropicLLM, ConfigError, FakeLLM, OpenAILLM, model_names
 from .models import Session
 from .store import DataStore
 
@@ -175,7 +175,7 @@ def config():
         "fake_llm": provider == "fake",
         "provider": provider,
         **(model_names(provider) if provider != "fake" else {}),
-        "effort": os.environ.get("CLAIMS_EFFORT", "").strip() or "medium",
+        "effort": os.environ.get("CLAIMS_EFFORT", "").strip() or DEFAULT_EFFORT,
         "today": store.today.isoformat(),
         "tts": "kokoro" if tts.available() else "browser",
     }

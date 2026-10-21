@@ -34,7 +34,7 @@ def anth_text(text="hello", stop="end_turn"):
 
 def test_anthropic_defaults_and_models():
     a = L.AnthropicLLM("k")
-    assert (a.extract_model, a.respond_model, a.effort) == ("claude-haiku-5-5", "claude-opus-5-5", "medium")
+    assert (a.extract_model, a.respond_model, a.effort) == ("claude-haiku-5-5", "claude-haiku-5-5", "low")
 
 
 def test_anthropic_env_overrides(monkeypatch):
@@ -69,7 +69,7 @@ def test_anthropic_respond_uses_respond_model_and_effort():
     a.client.beta.messages.create.return_value = anth_text("  hi  ")
     assert a.respond("sys", [{"role": "user", "content": "yo"}]) == "hi"
     kw = a.client.beta.messages.create.call_args.kwargs
-    assert kw["model"] == "claude-opus-5-5"
+    assert kw["model"] == "claude-haiku-5-5"
     assert kw["output_config"] == {"effort": "low"}
 
 
@@ -205,7 +205,7 @@ def test_config_reports_models_never_key(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "secret-key")
     c = server.config()
     assert c["provider"] == "anthropic" and c["extract_model"] == "claude-haiku-5-5"
-    assert c["respond_model"] == "claude-opus-5-5" and c["server_has_key"] is True
+    assert c["respond_model"] == "claude-haiku-5-5" and c["server_has_key"] is True
     assert "secret-key" not in str(c)
 
 

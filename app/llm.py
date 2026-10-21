@@ -21,8 +21,9 @@ from .models import Extraction
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 DEFAULT_EXTRACT_MODEL = "claude-haiku-5-5"
-DEFAULT_RESPOND_MODEL = "claude-opus-5-5"
-DEFAULT_EFFORT = "medium"
+# Haiku at low effort for the spoken reply: Opus at medium took most of a ~10 s voice turn (5b revised).
+DEFAULT_RESPOND_MODEL = "claude-haiku-5-5"
+DEFAULT_EFFORT = "low"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 

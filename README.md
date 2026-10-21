@@ -190,8 +190,8 @@ Set these in `.env` (see `.env.example`) or the shell.
 | `OPENAI_API_KEY` | unset | Key for the OpenAI provider (or paste it in the page) |
 | `OPENAI_BASE_URL` | unset | Base URL for an OpenAI-compatible provider |
 | `CLAIMS_EXTRACT_MODEL` | `claude-haiku-5-5` (anthropic), required for openai | Model for the extract call |
-| `CLAIMS_RESPOND_MODEL` | `claude-opus-5-5` (anthropic), required for openai | Model for the reply call |
-| `CLAIMS_EFFORT` | `medium` | Reply-call effort for anthropic: low, medium, high, xhigh, max |
+| `CLAIMS_RESPOND_MODEL` | `claude-haiku-5-5` (anthropic), required for openai | Model for the reply call |
+| `CLAIMS_EFFORT` | `low` | Reply-call effort for anthropic: low, medium, high, xhigh, max |
 | `CLAIMS_CONSENT_SCENARIO` | `default` | `default` approves on the second check, `timeout` never approves |
 | `CLAIMS_TTS` | auto | Set to `browser` to force the browser voice even when Kokoro is installed |
 | `CLAIMS_TTS_MODEL` | `models/kokoro-v1.0.int8.onnx` | Kokoro model file |

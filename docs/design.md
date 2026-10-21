@@ -52,7 +52,7 @@ An exact-match egress check runs on every prompt, reply and API response. Presid
 **Why:** this is where the procedure control lives.
 **Rejected:** merging the calls to save time. Latency is handled by model choice instead.
 
-**Decision:** Haiku 5.5 for extract and Opus 5.5 for the reply, both as settings. Reply effort starts at medium, to be swept across low, medium and high in live evals and set by the best quality for the time.
+**Decision:** Haiku 5.5 for extract and Haiku 5.5 at low effort for the reply, both as settings. The first build used Opus 5.5 at medium effort for the reply; the live voice test measured about 6.2 s per model round trip of a roughly 10 s silent gap, so the reply moved to Haiku at low effort for speed. `CLAIMS_RESPOND_MODEL` and `CLAIMS_EFFORT` switch it back.
 **Why:** extraction is a simple structured task and the reply benefits from the larger model.
 **Rejected:** the highest effort levels, which the effort documentation aims at long-running agentic work.
 
