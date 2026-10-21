@@ -2,6 +2,38 @@
 
 This page explains the agent in plain words: how one caller turn moves through the system, why code is in charge instead of the model, how identity details are kept away from the model, and how to test the voice agent yourself.
 
+## Two ways to talk to the agent
+
+The page has two voice buttons.
+Both run the same code for every decision, so verification, claim answers and handoffs come out the same.
+They differ in speed, in how natural the call sounds, and in where the audio goes.
+
+| | Realtime voice | Voice |
+|---|---|---|
+| Who listens and speaks | OpenAI's `gpt-realtime` speech-to-speech model | Chrome speech-to-text on the device, and Kokoro, a voice model on our own server |
+| How it feels | Natural: quick turn-taking, real interruptions, a human-sounding voice | A pause before each answer (1.8 to 3.8 s measured with Claude Haiku) and a plainer voice |
+| Who decides what is said | Our code, on every turn: the voice model sends each caller turn to our server and reads out the reply it gets back | Our code, on every turn |
+| When a reply is checked | Before it is handed to the voice. What the voice actually says is compared afterwards, and a warning shows if it differs | Every sentence is checked before it is spoken |
+| Privacy | The caller's raw audio goes to OpenAI, identity details included | No audio leaves the machine |
+| Key needed | An OpenAI key with Realtime access and credits | An Anthropic or OpenAI key |
+
+**Use Realtime voice** to judge how the conversation feels: speed, interruptions and tone.
+It is the best caller experience in this build.
+
+**Use Voice** when privacy is the point: real claims data, health details, a regulated deployment.
+No audio leaves the device, and nothing is spoken before code has checked it.
+
+**To test Realtime voice:**
+
+1. Start the server on OpenAI:
+   `CLAIMS_PROVIDER=openai CLAIMS_EXTRACT_MODEL=gpt-4.1-mini CLAIMS_RESPOND_MODEL=gpt-4.1-mini uv run --extra voice uvicorn app.server:app --port 8000`
+2. Open `http://localhost:8000` in Chrome and paste your OpenAI key into the key field.
+3. Click **New conversation**, then **Realtime voice**, and allow the microphone.
+4. Talk. Each thing you say appears in the chat as a caller message: that is exactly the text the voice passed to our code. The right-hand panel shows what code decided.
+5. Run the same calls with the **Voice** button and compare.
+
+Ten scripted calls to try, with the test caller's details and what each one proves, are [below](#how-to-test-the-voice-agent).
+
 ## The idea
 
 The caller talks to a model, but the model is not in charge.
@@ -50,9 +82,9 @@ How that is enforced:
 ## How to test the voice agent
 
 **Setup.**
-Start the server (see the README), open `http://localhost:8000` in Chrome, paste your API key, click **Voice** and allow the microphone.
+Start the server (see the README), open `http://localhost:8000` in Chrome, paste your API key, click **Voice** (or **Realtime voice** with an OpenAI key) and allow the microphone.
 Leave "Pause mic while agent speaks" unchecked so you can interrupt.
-Every test also works typed, if you would rather not talk.
+Every test also works with **Realtime voice**, and typed.
 
 **Test caller (fictional data).**
 Margaret Chen, date of birth March 15, 1985, ID ending 4472.
@@ -76,5 +108,5 @@ The right-hand panel shows the step the call is in, every check (pass or block),
 | 10 | After the claim answer, say yes to the summary email. Then ask for it at a different address. | The outbox panel shows the email going to the address on file, masked. The new address is refused. | The email only goes to the address on file |
 
 **Automated tests.**
-`uv run pytest -q` runs 214 unit and flow tests with no key.
+`uv run pytest -q` runs 222 unit and flow tests with no key.
 The eval runner plays 46 scripted calls against the server and grades the end state, not the wording (see "Tests and evals" in the README).

@@ -5,6 +5,38 @@ Code owns the procedure: it decides every Phase change, every safety gate and ev
 The model does only two jobs, reading each caller message into a structured form and phrasing the reply inside limits that code sets.
 The test page offers text chat and browser voice, and shows the Phase, the gate results, the stored Slots and the controller trace next to the conversation.
 
+## Start here: two ways to talk to the agent
+
+The page has two voice buttons.
+Both run the same code for every decision, so verification, claim answers and handoffs come out the same.
+They differ in speed, in how natural the call sounds, and in where the audio goes.
+
+| | Realtime voice | Voice |
+|---|---|---|
+| Who listens and speaks | OpenAI's `gpt-realtime` speech-to-speech model | Chrome speech-to-text on the device, and Kokoro, a voice model on our own server |
+| How it feels | Natural: quick turn-taking, real interruptions, a human-sounding voice | A pause before each answer (1.8 to 3.8 s measured with Claude Haiku) and a plainer voice |
+| Who decides what is said | Our code, on every turn: the voice model sends each caller turn to our server and reads out the reply it gets back | Our code, on every turn |
+| When a reply is checked | Before it is handed to the voice. What the voice actually says is compared afterwards, and a warning shows if it differs | Every sentence is checked before it is spoken |
+| Privacy | The caller's raw audio goes to OpenAI, identity details included | No audio leaves the machine |
+| Key needed | An OpenAI key with Realtime access and credits | An Anthropic or OpenAI key |
+
+**Use Realtime voice** to judge how the conversation feels: speed, interruptions and tone.
+It is the best caller experience in this build.
+
+**Use Voice** when privacy is the point: real claims data, health details, a regulated deployment.
+No audio leaves the device, and nothing is spoken before code has checked it.
+
+**To test Realtime voice:**
+
+1. Start the server on OpenAI:
+   `CLAIMS_PROVIDER=openai CLAIMS_EXTRACT_MODEL=gpt-4.1-mini CLAIMS_RESPOND_MODEL=gpt-4.1-mini uv run --extra voice uvicorn app.server:app --port 8000`
+2. Open `http://localhost:8000` in Chrome and paste your OpenAI key into the key field.
+3. Click **New conversation**, then **Realtime voice**, and allow the microphone.
+4. Talk. Each thing you say appears in the chat as a caller message: that is exactly the text the voice passed to our code. The right-hand panel shows what code decided.
+5. Run the same calls with the **Voice** button and compare.
+
+Ten scripted calls to try, with the test caller's details and what each one proves, are in [docs/how-it-works.md](docs/how-it-works.md).
+
 ## Quick start
 
 You need either [uv](https://docs.astral.sh/uv/) or Docker.
@@ -164,7 +196,7 @@ What never reaches the model:
 
 Other controls:
 
-- Speech recognition and speech output run on the device, so audio and spoken text do not go to a speech vendor.
+- With the Voice button, speech recognition runs in the browser and speech output runs on our server, so audio and spoken text do not go to a speech vendor. Realtime voice is the exception: it sends the caller's audio to OpenAI.
 - An exact-match check runs on every prompt, reply and API response for the stored date of birth, phone, email and ID last four.
 - Memory, traces and API responses carry masked values.
 
@@ -193,6 +225,7 @@ See `evals/README.md` for the options.
 ## Known limits
 
 - Every scored result above comes from the deterministic stand-in; live runs were by hand only.
+- Realtime voice was tested by hand in a few live calls, and the server log showed every caller turn reaching `/api/chat`. The scripted evals do not cover it, and OpenAI documents that a model's instructions are guidance, so the spoken words are checked after the fact rather than before.
 - Voice was tried by hand with a real microphone. With Claude Haiku 5.5 at low effort, the first spoken sentence came 1.8 to 3.8 s after the caller's turn ended (3 turns, measured in the browser). The VAD thresholds are not tuned yet.
 - A speech-to-speech model (such as OpenAI Realtime) would sound more natural, but it hears the caller's raw audio, identity details included, and speaks before code can check a sentence. That is why it is not the default here.
 - Presidio is optional and stays off unless installed with the `presidio` extra. Without it, the parser's own patterns and the fail-closed sweep do the work.
