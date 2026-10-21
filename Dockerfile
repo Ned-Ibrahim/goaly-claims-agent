@@ -5,7 +5,7 @@ WORKDIR /srv
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.13 /uv /usr/local/bin/uv
 
-# Dependencies come from pyproject.toml and uv.lock (anthropic, openai, fastapi, uvicorn, pydantic, python-dotenv).
+# Dependencies come from pyproject.toml and uv.lock (anthropic, openai, fastapi, uvicorn, pydantic, python-dotenv, httpx).
 # The optional Presidio group is left out: without it the parser and the fail-closed sweep still run.
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project

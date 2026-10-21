@@ -253,6 +253,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "openai" },
     { name = "pydantic" },
     { name = "python-dotenv" },
@@ -277,6 +278,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.70" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "kokoro-onnx", marker = "extra == 'voice'", specifier = ">=0.6.1" },
     { name = "openai", specifier = ">=1.60" },
     { name = "presidio-analyzer", marker = "extra == 'presidio'", specifier = ">=2.2" },
