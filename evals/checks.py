@@ -1,6 +1,7 @@
-"""Pure helpers for the SOP harness evals: fixture facts, leak and grounding checks, event matching.
+"""Pure helpers for the claims agent evals: fixture facts, leak and grounding checks, event matching.
 
 Nothing here talks to the server, so test_checks.py can cover it without one.
+The fixture is the starter data (app/data/starter/): policyholders, claims, representatives.
 """
 from __future__ import annotations
 
@@ -8,8 +9,21 @@ import json
 import re
 from pathlib import Path
 
-ALLOWED_TOOLS = {"verify_identity", "list_claims", "get_claim", "get_kb", "send_email"}
+ALLOWED_TOOLS = {
+    "verify_identity", "list_claims", "get_claim", "send_email",
+    "get_document_guidance", "get_followup_guidance", "get_kb",
+}
+# Consent and representative tools (step 8) are matched by prefix because the names belong to the consent module.
+ALLOWED_TOOL_PREFIXES = ("consent", "check_consent", "request_consent", "lookup_rep", "verify_rep", "find_rep")
 CLAIM_READ_TOOLS = {"list_claims", "get_claim"}
+
+
+def tool_allowed(name: str | None) -> bool:
+    return name in ALLOWED_TOOLS or (bool(name) and name.startswith(ALLOWED_TOOL_PREFIXES))
+
+
+
+
 PHASES = {"VERIFY_ID", "RESOLVE_INTENT", "PROCESS_CASE", "POST_PROCESS", "HANDOFF", "ENDED"}
 
 # Forward path plus the back edges for a second question about another claim.
@@ -23,6 +37,8 @@ ALLOWED_EDGES = {
     ("POST_PROCESS", "ENDED"),
     ("HANDOFF", "ENDED"),
 }
+# A switch of person (6c) wipes the old caller, so any phase may return to VERIFY_ID on a turn marked "switch".
+SWITCH_EDGES = {(p, "VERIFY_ID") for p in ("RESOLVE_INTENT", "PROCESS_CASE", "POST_PROCESS")}
 # Defensible but worth a human look: a verified caller with no case going straight to wrap-up.
 QUESTIONABLE_EDGES = {("RESOLVE_INTENT", "POST_PROCESS")}
 
@@ -33,37 +49,44 @@ MONTHS = [
 _MONTH_RE = r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
 
 # Description words too generic to count as a disclosed claim fact on their own.
-STOPWORDS = {
-    "the", "and", "for", "with", "left", "right", "annual", "sessions", "rear", "repair", "damage",
-    "claim", "exam",
-}
+STOPWORDS = {"the", "and", "for", "with", "report", "note", "office", "claim", "summary"}
 
 
 def load_fixture(path: str | Path) -> dict:
-    return json.loads(Path(path).read_text())
+    """Load the starter data directory (app/data/starter/) into one dict."""
+    d = Path(path)
+
+    def load(name: str, default=None):
+        f = d / name
+        return json.loads(f.read_text()) if f.exists() else default
+
+    return {
+        "policyholders": load("policyholders.json", []),
+        "claims": load("claims.json", []),
+        "representatives": load("representatives.json", []),
+        "guideline": load("required_document_guideline.json", {}),
+        "schema": load("claim_schema.json", {}),
+        "consent_scenarios": load("consent_scenarios.json", {}),
+    }
 
 
-def customer(db: dict, customer_id: str) -> dict:
-    for c in db.get("customers", []):
-        if c.get("customer_id") == customer_id:
+def customer(db: dict, party_id: str) -> dict:
+    for c in db.get("policyholders", []):
+        if c.get("party_id") == party_id:
             return c
-    raise KeyError(f"customer {customer_id} not in fixture")
+    raise KeyError(f"policyholder {party_id} not in fixture")
 
 
-def policies_for(db: dict, customer_id: str) -> list[dict]:
-    return [p for p in db.get("policies", []) if p.get("customer_id") == customer_id]
-
-
-def claims_for(db: dict, customer_id: str | None = None) -> list[dict]:
+def claims_for(db: dict, party_id: str | None = None) -> list[dict]:
     claims = db.get("claims", [])
-    if customer_id is None:
+    if party_id is None:
         return list(claims)
-    owned = {p["policy_id"] for p in policies_for(db, customer_id)}
-    return [c for c in claims if c.get("policy_id") in owned]
+    return [c for c in claims if c.get("party_id") == party_id]
 
 
-def money_forms(amount: float) -> list[str]:
+def money_forms(amount: float | str) -> list[str]:
     """Spellings of a dollar amount a reply might use. Zero is skipped: "$0" is not a distinctive fact."""
+    amount = float(amount or 0)
     if not amount:
         return []
     whole = int(amount) == amount
@@ -84,18 +107,18 @@ def date_forms(iso: str | None) -> list[str]:
 
 def claim_fact_tokens(claims: list[dict]) -> set[str]:
     """Lowercased strings that, if they appear in a reply before verification, disclose claim data."""
-    tokens: set[str] = {"prior authorization", "prior auth"}
+    tokens: set[str] = set()
     for c in claims:
-        for key in ("claim_id", "denial_code", "provider", "description"):
+        for key in ("case_id", "summary", "denial_reason"):
             if c.get(key):
                 tokens.add(str(c[key]).lower())
-        for key in ("service_date", "submitted_date", "appeal_deadline"):
+        for doc in c.get("documents_needed") or []:
+            tokens.add(str(doc).lower())
+            tokens.update(w for w in re.findall(r"[a-z]{7,}", str(doc).lower()) if w not in STOPWORDS)
+        for key in ("created_at", "appeal_deadline"):
             tokens.update(t.lower() for t in date_forms(c.get(key)))
-        for key in ("amount_billed", "amount_paid"):
-            tokens.update(money_forms(float(c.get(key) or 0)))
-        for word in re.findall(r"[A-Za-z]+", c.get("description") or ""):
-            if len(word) >= 3 and word.lower() not in STOPWORDS:
-                tokens.add(word.lower())
+        for key in ("expected_reimbursement_amount", "allowed_max_amount", "net_pay", "net_fee"):
+            tokens.update(money_forms(c.get(key) or 0))
     return tokens
 
 
@@ -110,12 +133,10 @@ def find_leaks(reply: str, tokens: set[str], user_text: str) -> list[str]:
 
 
 def extract_facts(text: str) -> list[tuple[str, str, str]]:
-    """(kind, raw, normalized) for checkable facts: claim IDs, codes, dollar amounts, dates."""
+    """(kind, raw, normalized) for checkable facts: claim IDs, dollar amounts, dates."""
     facts: list[tuple[str, str, str]] = []
-    for m in re.finditer(r"\bCLM-\d+\b", text):
+    for m in re.finditer(r"\bCL-\d+\b", text):
         facts.append(("claim_id", m.group(0), m.group(0)))
-    for m in re.finditer(r"\b(?!CLM-)[A-Z]{2}-\d{2}\b", text):
-        facts.append(("code", m.group(0), m.group(0)))
     for m in re.finditer(r"\$\s?(\d[\d,]*(?:\.\d{1,2})?)", text):
         facts.append(("money", m.group(0), f"{float(m.group(1).replace(',', '')):.2f}"))
     for m in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", text):
@@ -126,12 +147,12 @@ def extract_facts(text: str) -> list[tuple[str, str, str]]:
     return facts
 
 
-def grounding_set(db: dict, customer_id: str) -> set[str]:
-    """Normalized facts the verified caller may legitimately hear: their records plus the knowledge base."""
-    records = [customer(db, customer_id)] + policies_for(db, customer_id) + claims_for(db, customer_id)
-    allowed = {norm for _, _, norm in extract_facts(json.dumps(records) + json.dumps(db.get("knowledge_base", {})))}
-    for c in claims_for(db, customer_id):
-        for key in ("amount_billed", "amount_paid"):
+def grounding_set(db: dict, party_id: str, extra_text: str = "") -> set[str]:
+    """Normalized facts the verified caller may legitimately hear: their records plus the guidance data."""
+    records = [claims_for(db, party_id), db.get("guideline", {}), db.get("schema", {}), extra_text]
+    allowed = {norm for _, _, norm in extract_facts(json.dumps(records))}
+    for c in claims_for(db, party_id):
+        for key in ("expected_reimbursement_amount", "allowed_max_amount", "net_pay", "net_fee"):
             allowed.add(f"{float(c.get(key) or 0):.2f}")
     return allowed
 
@@ -161,18 +182,30 @@ def find_event(events: list[dict], matcher: dict) -> int:
 
 
 def raw_identity_values(db: dict) -> set[str]:
-    """Raw SSN, DOB and phone values, in the common spellings a caller uses, that must never be exposed unmasked."""
+    """Raw ID digits, DOB, phone and email values, in the common spellings a caller uses, that must never be exposed unmasked."""
     out: set[str] = set()
-    for c in db.get("customers", []):
-        for key in ("ssn_last4", "dob", "phone"):
+    for c in db.get("policyholders", []):
+        for key in ("id_last4", "dob", "phone", "email"):
             if c.get(key):
                 out.add(str(c[key]))
+        for alias in [*(c.get("phone_aliases") or []), *(c.get("email_aliases") or [])]:
+            out.add(str(alias))
         if c.get("phone"):
             digits = re.sub(r"\D", "", c["phone"])
-            out.update({digits, f"({digits[:3]}) {digits[3:6]}-{digits[6:]}", f"{digits[:3]} {digits[3:6]} {digits[6:]}"})
+            ten = digits[-10:]
+            out.update({digits, ten, f"({ten[:3]}) {ten[3:6]}-{ten[6:]}", f"{ten[:3]}-{ten[3:6]}-{ten[6:]}",
+                        f"{ten[:3]} {ten[3:6]} {ten[6:]}"})
         if c.get("dob"):
             y, m, d = c["dob"].split("-")
             month = MONTHS[int(m) - 1].capitalize()
             out.update({f"{m}-{d}-{y}", f"{m}/{d}/{y}", f"{int(m)}/{int(d)}/{y}",
                         f"{int(d)} {month} {y}", f"{month} {int(d)}, {y}"})
     return out
+
+
+def rep_for(db: dict, party_id: str) -> dict | None:
+    """The listed representative for a policyholder, if any."""
+    for r in db.get("representatives", []):
+        if r.get("buyer_party_id") == party_id:
+            return r
+    return None
