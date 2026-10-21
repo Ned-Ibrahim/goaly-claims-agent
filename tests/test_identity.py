@@ -46,7 +46,8 @@ def test_voice_details_are_read_back_before_the_check(env):
     assert "ID ending 4, 4, 7, 2" in reply and "birth date March 15, 1985" in reply
     assert reply.endswith("Is that right?")
     assert not [e for e in r[0]["events"] if e.get("name") == "verify_identity"]
-    assert sorted(s.readback_fields) == ["dob", "id_last4"]  # the name is not read back
+    assert sorted(s.readback_fields) == ["dob", "full_name", "id_last4"]  # a misheard name fails the check too
+    assert reply.startswith("I heard the name ")
 
 
 def test_readback_yes_runs_the_check(env):
@@ -58,9 +59,8 @@ def test_readback_yes_runs_the_check(env):
 def test_readback_no_drops_only_those_details_and_is_not_a_failure(env):
     s, r = run(env, MARGARET, "no", channel="voice")
     assert s.counters["verify_failures"] == 0 and s.pending is None
-    assert set(s.identity) == {"full_name"}
-    assert "id.dob" not in s.memory and "id.id_last4" not in s.memory
-    assert "id.full_name" in s.memory
+    assert set(s.identity) == set()  # the name was read back with the rest, so a no drops it too
+    assert "id.dob" not in s.memory and "id.id_last4" not in s.memory and "id.full_name" not in s.memory
     assert not s.verified and r[1]["phase"] == "VERIFY_ID"
     # Giving them again (by voice) reads them back again, then yes verifies.
     s, r = run(env, MARGARET, "yes", session=s, channel="voice")
