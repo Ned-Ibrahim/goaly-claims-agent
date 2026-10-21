@@ -198,15 +198,21 @@ async function send(text, channel = "text") {
   autosize();
   const typing = addMessage("agent typing", "Ava is typing…");
   const heard = takeHeard();
+  let streaming = false;
   try {
     const headers = { "content-type": "application/json" };
     const key = $("apiKey").value.trim();
     if (key) headers["x-api-key"] = key;
-    const res = await fetch("/api/chat", {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ session_id: sessionId, message: text, channel, heard }),
-    });
+    const body = JSON.stringify({ session_id: sessionId, message: text, channel, heard });
+    if (channel === "voice" && Voice.on) {
+      streaming = true;
+      const sres = await fetch("/api/chat/stream", { method: "POST", headers, body });
+      if (sres.status !== 404) { // 404: an older server without the stream endpoint
+        await readChatStream(sres, typing);
+        return;
+      }
+    }
+    const res = await fetch("/api/chat", { method: "POST", headers, body });
     const data = await res.json();
     typing.remove();
     if (!res.ok) {
@@ -220,6 +226,7 @@ async function send(text, channel = "text") {
   } catch (err) {
     typing.remove();
     showError("Could not reach the server. Is it running?");
+    if (streaming) Voice.finish(false);
   } finally {
     sending = false;
     Voice.flush();
@@ -227,6 +234,80 @@ async function send(text, channel = "text") {
       $("send").disabled = false;
       $("input").focus();
     }
+  }
+}
+
+// Voice turns: read the ndjson stream, speak sentences as they arrive, then render the final result.
+async function readChatStream(res, typing) {
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json()).detail; } catch { /* not json */ }
+    typing.remove();
+    showError(detail || `Request failed (${res.status}).`);
+    return;
+  }
+  let bubble = null;
+  let textNode = null;
+  let streamed = "";
+  let finished = false;
+  const handle = async (msg) => {
+    if (msg.type === "sentence") {
+      if (!bubble) {
+        typing.remove();
+        bubble = addMessage("agent", "");
+        textNode = bubble.firstChild || bubble.appendChild(document.createTextNode(""));
+        Voice.beginReply(bubble);
+      }
+      streamed = streamed ? `${streamed} ${msg.text}` : msg.text;
+      textNode.data = streamed;
+      $("log").scrollTop = $("log").scrollHeight;
+      Voice.enqueue(msg.text);
+    } else if (msg.type === "done") {
+      finished = true;
+      typing.remove();
+      const spoke = !!bubble;
+      if (!bubble) {
+        bubble = addMessage("agent", msg.reply);
+        textNode = bubble.firstChild;
+      } else {
+        textNode.data = msg.reply;
+      }
+      if (msg.phase) textNode.after(el("span", "meta", msg.phase));
+      render(msg);
+      if (spoke) Voice.streamDone(msg.reply, bubble, msg.ended);
+      else Voice.speak(msg.reply, bubble, msg.ended);
+      await refreshOutbox();
+    } else if (msg.type === "error") {
+      finished = true;
+      typing.remove();
+      showError(msg.detail || "The reply failed.");
+      Voice.finish(false);
+    }
+  };
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  const drain = async (final) => {
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (line) await handle(JSON.parse(line));
+    }
+    if (final && buf.trim()) { const line = buf.trim(); buf = ""; await handle(JSON.parse(line)); }
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    await drain(false);
+  }
+  buf += dec.decode();
+  await drain(true);
+  if (!finished) {
+    typing.remove();
+    showError("The reply stream ended early.");
+    Voice.finish(false);
   }
 }
 
@@ -267,6 +348,7 @@ async function loadConfig() {
       if (cfg.server_has_key) $("apiKey").placeholder = "optional: server has a key";
     }
     ttsMode = cfg.tts === "kokoro" ? "kokoro" : "browser";
+    if (ttsMode === "kokoro") prefetchAcks();
     if (cfg.today) {
       $("asof").textContent = `data date ${cfg.today}`;
       $("asof").hidden = false;
@@ -280,17 +362,58 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const LANG = "en-US";
 const SILENCE_MS = 1300;        // end of turn after normal replies
 const SILENCE_NUMBER_MS = 2800; // longer after the agent asked for a date or number
-const ASKS_NUMBER = /\b(date of birth|birth ?date|birthday|dob|phone|number|digits|last (four|4)|ssn|id|policy|claim|zip|code)\b/i;
+const ASKS_NUMBER = /\b(date of birth|birth ?date|birthday|dob|phone|last (four|4)|digits|id number|zip|e-?mail)\b/i;
+const VAD_EXTRA_NUMBER_MS = 1200; // extra wait after speech end when a date or number is expected
+const VAD_SAFETY_MS = 1500;       // flush this long after the last final result if the VAD missed the end
+const VAD_END_FLOOR_MS = 200;     // never flush sooner than this after speech end (non-digit questions)
+const VAD_FLUSH_LATE_MS = 150;    // flush this long after a final result that arrives after the VAD end
+const ORT_BASE = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
+const VAD_BASE = "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.31/dist/";
+const ACKS = ["Okay.", "Got it.", "Alright.", "Sure."];
+const MIN_SENTENCE = 25;
+const MAX_TTS_INFLIGHT = 2;
 
 let ttsMode = "browser"; // "kokoro" when the server can speak (config)
 let pendingHeard = null; // spoken part of an interrupted reply, sent with the next message
 function takeHeard() { const h = pendingHeard; pendingHeard = null; return h; }
 
+// Acknowledgment clips for kokoro, fetched once after config tells us the server can speak.
+const ackUrls = new Map();
+let ackIdx = -1;
+async function prefetchAcks() {
+  for (const text of ACKS) {
+    if (ackUrls.has(text)) continue;
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (res.ok) ackUrls.set(text, URL.createObjectURL(await res.blob()));
+    } catch { /* no ack for this clip */ }
+  }
+}
+
+// End at . ? ! followed by space or end; a piece under MIN_SENTENCE chars joins the next one.
+function splitSentences(text) {
+  const pieces = (text.match(/.+?(?:[.!?]+(?=\s|$)|$)/gs) || [text]).map((p) => p.trim()).filter(Boolean);
+  const out = [];
+  let carry = "";
+  for (const p of pieces) {
+    const cur = carry ? `${carry} ${p}` : p;
+    if (cur.length < MIN_SENTENCE) carry = cur;
+    else { out.push(cur); carry = ""; }
+  }
+  if (carry) out.push(carry);
+  return out;
+}
+
 const Voice = {
   on: false, rec: null, stream: null, track: null,
   buffer: "", timer: null, silenceMs: SILENCE_MS,
-  utter: null, audio: null, audioUrl: null, bubble: null, fullText: "", charIndex: 0, endAfter: false,
-  noVoiceSaid: false, usable: false, ticket: 0, fetching: false,
+  utter: null, audio: null, q: null, ack: null, deferred: null, bubble: null, fullText: "", charIndex: 0, endAfter: false,
+  noVoiceSaid: false, prefix: "", usable: false, ticket: 0,
+  vad: null, vadEnded: false, vadEndAt: 0, interim: "", asksNumber: false,
 
   note(msg) { $("voiceNote").textContent = msg || ""; },
 
@@ -360,6 +483,7 @@ const Voice = {
     this.on = true;
     this.buildRecognition();
     this.startRecognition();
+    this.startVad(); // not awaited: the model download must not delay the recognizer
     $("mic").classList.add("on");
     $("mic").setAttribute("aria-pressed", "true");
     $("micLabel").textContent = "Listening";
@@ -373,7 +497,7 @@ const Voice = {
     rec.processLocally = true;
     rec.continuous = true;
     rec.interimResults = true;
-    rec.onspeechstart = () => this.onCallerSpeech();
+    rec.onspeechstart = () => $("mic").classList.add("heard");
     rec.onresult = (e) => this.onResult(e);
     rec.onerror = (e) => this.onError(e);
     rec.onend = () => { if (this.on) setTimeout(() => this.startRecognition(), 150); };
@@ -406,11 +530,12 @@ const Voice = {
   stop() {
     this.on = false;
     clearTimeout(this.timer);
+    this.stopVad();
     try { this.rec?.abort(); } catch { /* ignore */ }
     this.rec = null;
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null; this.track = null;
-    this.buffer = "";
+    this.buffer = ""; this.interim = ""; this.vadEnded = false;
     this.cancelSpeech(false);
     $("mic").classList.remove("on", "heard");
     $("mic").setAttribute("aria-pressed", "false");
@@ -420,17 +545,75 @@ const Voice = {
     this.note("");
   },
 
-  get speaking() { return !!(this.utter || this.audio); },
+  get speaking() { return !!(this.utter || this.audio || this.ack); },
+  get fetching() { return !!this.q && !this.audio; },
   get muted() { return $("pauseMic").checked && this.speaking; },
 
   applyMute() {
     if (this.track) this.track.enabled = !this.muted;
   },
 
-  // Caller started talking: barge in on the agent (3a).
-  onCallerSpeech() {
+  // Silero VAD on the same echo-cancelled stream. Any failure leaves the recognizer-only behaviour.
+  async startVad() {
+    const stream = this.stream;
+    let v = null;
+    try {
+      if (!window.vad || !window.vad.MicVAD) throw new Error("vad-web did not load");
+      v = await window.vad.MicVAD.new({
+        model: "v5",
+        minSpeechMs: 300,
+        redemptionMs: 700,
+        getStream: async () => stream,
+        pauseStream: async () => {},          // never stop the tracks: SpeechRecognition shares this one
+        resumeStream: async () => stream,
+        onnxWASMBasePath: ORT_BASE,
+        baseAssetPath: VAD_BASE,
+        onSpeechStart: () => this.onVadStart(),
+        onSpeechRealStart: () => this.onVadRealStart(),
+        onSpeechEnd: () => this.onVadEnd(),
+        onVADMisfire: () => { if (this.buffer) this.scheduleEndFlush(0); }, // re-arm only, vadEndAt stays
+      });
+      if (!this.on || this.stream !== stream) { v.destroy(); return; }
+      this.vad = v;
+      await v.start();
+    } catch (err) {
+      if (v) { try { v.destroy(); } catch { /* ignore */ } }
+      this.vad = null;
+      console.warn("VAD unavailable, using recognizer timers only:", err);
+    }
+  },
+
+  stopVad() {
+    const v = this.vad;
+    this.vad = null;
+    try { v?.destroy(); } catch { /* ignore */ }
+  },
+
+  // A new burst of speech cancels any flush that was waiting for the caller to finish.
+  onVadStart() {
     $("mic").classList.add("heard");
+    this.vadEnded = false;
+    clearTimeout(this.timer);
+  },
+
+  // Only confirmed speech (past minSpeechMs) interrupts the agent.
+  onVadRealStart() {
     if ((this.speaking || this.fetching) && !this.muted) this.cancelSpeech(true);
+  },
+
+  onVadEnd() {
+    this.vadEnded = true;
+    this.vadEndAt = Date.now();
+    this.scheduleEndFlush(0);
+  },
+
+  // Flush once the recognizer has final text and nothing interim is pending.
+  scheduleEndFlush(minDelay) {
+    clearTimeout(this.timer);
+    if (!this.buffer || this.interim) return;
+    const extra = this.asksNumber ? VAD_EXTRA_NUMBER_MS - (Date.now() - this.vadEndAt) : 0;
+    const delay = this.asksNumber ? Math.max(minDelay, extra, 0) : Math.max(minDelay, VAD_END_FLOOR_MS);
+    this.timer = setTimeout(() => this.flush(), delay);
   },
 
   onResult(e) {
@@ -442,9 +625,18 @@ const Voice = {
       if (r.isFinal) { this.buffer = (this.buffer + " " + t).trim(); }
       else interim += t;
     }
-    if (interim || this.buffer) this.onCallerSpeech();
-    showInterim((this.buffer + " " + interim).trim());
+    this.interim = interim.trim();
+    const text = (this.buffer + " " + interim).trim();
+    if (text) $("mic").classList.add("heard");
+    // Without the VAD, a single noisy word must not cut the agent off.
+    if (!this.vad && text.split(/\s+/).length >= 2 && (this.speaking || this.fetching)) this.cancelSpeech(true);
+    showInterim(text);
     clearTimeout(this.timer);
+    if (this.vad) {
+      if (this.vadEnded) this.scheduleEndFlush(VAD_FLUSH_LATE_MS);
+      else if (this.buffer) this.timer = setTimeout(() => this.flush(), this.interim ? VAD_SAFETY_MS * 2 : VAD_SAFETY_MS);
+      return;
+    }
     if (this.buffer && !interim) this.timer = setTimeout(() => this.flush(), this.silenceMs);
     else if (this.buffer) this.timer = setTimeout(() => this.flush(), this.silenceMs + 1500);
   },
@@ -455,15 +647,66 @@ const Voice = {
     if (!this.buffer) return;
     if (sending) { this.timer = setTimeout(() => this.flush(), 300); return; }
     const text = this.buffer;
-    this.buffer = "";
+    this.buffer = ""; this.interim = ""; this.vadEnded = false;
     $("mic").classList.remove("heard");
     clearInterim();
+    if ((this.speaking || this.fetching) && !this.ack) this.cancelSpeech(true);
+    this.playAck();
     send(text, "voice");
+  },
+
+  // Short canned clip so the caller hears something while the model works. Not shown in the log.
+  playAck() {
+    if (!this.on || this.utter || this.audio || this.q) return;
+    this.stopAck();
+    ackIdx = (ackIdx + 1) % ACKS.length;
+    const text = ACKS[ackIdx];
+    if (ttsMode === "kokoro") {
+      const url = ackUrls.get(text);
+      if (!url) return;
+      const a = new Audio(url);
+      const done = () => this.ackDone(a);
+      a.onended = done;
+      a.onerror = done;
+      this.ack = a;
+      a.play().catch(done);
+    } else {
+      const voice = window.speechSynthesis && this.pickVoice();
+      if (!voice) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.voice = voice;
+      u.lang = voice.lang;
+      u.onend = () => this.ackDone(u);
+      u.onerror = () => this.ackDone(u);
+      this.ack = u;
+      window.speechSynthesis.speak(u);
+    }
+    this.applyMute();
+  },
+
+  stopAck() {
+    const x = this.ack;
+    if (!x) return;
+    this.ack = null;
+    if (x instanceof Audio) { x.onended = null; x.onerror = null; try { x.pause(); } catch { /* ignore */ } }
+    else { try { window.speechSynthesis.cancel(); } catch { /* ignore */ } }
+    this.applyMute();
+  },
+
+  // The reply waits for the ack to finish rather than cutting it off.
+  ackDone(x) {
+    if (this.ack !== x) return;
+    this.ack = null;
+    this.applyMute();
+    const d = this.deferred;
+    this.deferred = null;
+    if (d) this.speakBrowser(...d);
+    else this.tryPlay();
   },
 
   reset() {
     clearTimeout(this.timer);
-    this.buffer = "";
+    this.buffer = ""; this.interim = ""; this.vadEnded = false;
     pendingHeard = null;
     this.cancelSpeech(false);
     clearInterim();
@@ -474,58 +717,158 @@ const Voice = {
     return voices.find((v) => v.lang === LANG) || voices.find((v) => /^en/i.test(v.lang)) || null;
   },
 
+  setAsks(text) {
+    this.asksNumber = ASKS_NUMBER.test(text);
+    this.silenceMs = this.asksNumber ? SILENCE_NUMBER_MS : SILENCE_MS;
+  },
+
   speak(text, bubble, ended) {
-    this.silenceMs = ASKS_NUMBER.test(text) ? SILENCE_NUMBER_MS : SILENCE_MS;
+    this.setAsks(text);
     if (!this.on) return;
     if (ttsMode === "kokoro") return this.speakServer(text, bubble, ended);
+    if (this.ack) { this.deferred = [text, bubble, ended]; return; } // browser ack still talking
     this.speakBrowser(text, bubble, ended);
   },
 
-  // Server voice (Kokoro): fetch the WAV as soon as the reply arrives, play it with an Audio element.
-  // Any error falls back to the browser voice. Each call gets a ticket so a newer reply wins.
-  async speakServer(text, bubble, ended) {
-    this.cancelSpeech(false);
-    const ticket = ++this.ticket;
-    this.bubble = bubble; this.fullText = text; this.endAfter = !!ended;
-    this.fetching = true;
+  // Server voice (Kokoro): sentences are fetched ahead (two at a time) and played in order.
+  // A newer reply or a skip bumps the ticket, which drops everything in flight.
+  speakServer(text, bubble, ended) {
+    this.beginReply(bubble);
+    this.fullText = text;
+    for (const s of splitSentences(text)) this.enqueue(s);
+    this.finish(ended);
+  },
+
+  // Open an empty reply queue. A streamed reply fills it with enqueue() and closes it with finish().
+  beginReply(bubble) {
+    if (!this.on || ttsMode !== "kokoro") return;
+    this.stopReply();
+    this.q = { ticket: this.ticket, items: [], pos: 0, inflight: 0, finished: false, played: [] };
+    this.bubble = bubble; this.fullText = ""; this.endAfter = false; this.prefix = "";
     this.applyMute();
-    let url;
+  },
+
+  // The streamed reply is complete. Kokoro speaks what was queued; the browser voice speaks it whole now.
+  streamDone(text, bubble, ended) {
+    this.setAsks(text);
+    if (!this.on) return;
+    if (ttsMode !== "kokoro") return this.speak(text, bubble, ended);
+    if (this.q) { this.fullText = text; this.finish(ended); } // else interrupted: nothing left to speak
+  },
+
+  // Add one sentence to the current reply. A streamed reply can call this as sentences arrive.
+  enqueue(text) {
+    if (!this.q) return;
+    this.q.items.push({ text, state: "new", url: null, audio: null });
+    this.pump();
+  },
+
+  // No more sentences are coming.
+  finish(ended) {
+    if (!this.q) return;
+    if (ended !== undefined) this.endAfter = !!ended;
+    this.q.finished = true;
+    this.tryPlay();
+  },
+
+  pump() {
+    const q = this.q;
+    if (!q) return;
+    for (const item of q.items) {
+      if (q.inflight >= MAX_TTS_INFLIGHT) break;
+      if (item.state === "new") this.fetchItem(q, item);
+    }
+  },
+
+  async fetchItem(q, item) {
+    item.state = "fetching";
+    q.inflight++;
+    let blob = null;
     try {
       const res = await fetch("/api/tts", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text: item.text }),
       });
       if (!res.ok) throw new Error(`tts ${res.status}`);
-      url = URL.createObjectURL(await res.blob());
-      if (ticket !== this.ticket) { URL.revokeObjectURL(url); return; } // skipped or superseded
-      const a = new Audio(url);
-      const done = () => {
-        if (this.audio !== a) return;
-        this.clearAudio();
-        this.bubble = null;
-        this.applyMute();
-        if (this.endAfter) this.stop();
-      };
-      a.onended = done;
-      a.onerror = done;
-      this.audio = a; this.audioUrl = url; this.fetching = false;
-      await a.play();
-      this.applyMute();
-    } catch {
-      if (url && this.audioUrl !== url) URL.revokeObjectURL(url);
-      if (ticket !== this.ticket) return;
-      this.clearAudio();
-      this.fetching = false;
-      this.speakBrowser(text, bubble, ended);
+      blob = await res.blob();
+    } catch { /* marked failed below */ }
+    q.inflight--;
+    if (q.ticket !== this.ticket) return; // skipped or superseded
+    if (blob) {
+      item.url = URL.createObjectURL(blob);
+      item.audio = new Audio(item.url);
+      item.audio.preload = "auto";
+      item.state = "ready";
+    } else {
+      item.state = "failed";
     }
+    this.pump();
+    this.tryPlay();
   },
 
-  clearAudio() {
+  // Play the next sentence if it is ready and nothing else is speaking.
+  tryPlay() {
+    const q = this.q;
+    if (!q || this.ack || this.audio) return;
+    if (q.pos >= q.items.length) { if (q.finished) this.replyDone(); return; }
+    const item = q.items[q.pos];
+    if (item.state === "failed") return this.fallbackBrowser();
+    if (item.state !== "ready") return;
+    const a = item.audio;
+    const next = () => {
+      if (this.audio !== a || this.q !== q) return;
+      a.onended = null; a.onerror = null;
+      URL.revokeObjectURL(item.url);
+      this.audio = null;
+      q.played.push(item.text);
+      q.pos++;
+      this.tryPlay();
+    };
+    a.onended = next;
+    a.onerror = next;
+    this.audio = a;
+    this.applyMute();
+    a.play().catch(() => {
+      if (this.audio !== a || this.q !== q) return;
+      a.onended = null; a.onerror = null;
+      this.audio = null;
+      item.state = "failed";
+      this.fallbackBrowser();
+    });
+  },
+
+  replyDone() {
+    this.q = null;
+    this.bubble = null;
+    this.applyMute();
+    if (this.endAfter) this.stop();
+  },
+
+  // A sentence could not be fetched or played: speak the rest with the browser voice.
+  fallbackBrowser() {
+    const q = this.q;
+    const rest = q.items.slice(q.pos).map((i) => i.text).join(" ");
+    const { bubble, endAfter } = this;
+    const prefix = q.played.join(" ");
+    this.stopReply();
+    this.speakBrowser(rest, bubble, endAfter, prefix);
+  },
+
+  // Drop the current reply (audio, queue, browser utterance) but leave any ack alone.
+  stopReply() {
+    this.ticket++;
+    const q = this.q;
+    this.q = null;
+    if (q) for (const i of q.items) if (i.url) URL.revokeObjectURL(i.url);
     const a = this.audio;
     this.audio = null;
     if (a) { a.onended = null; a.onerror = null; try { a.pause(); } catch { /* ignore */ } }
-    if (this.audioUrl) { URL.revokeObjectURL(this.audioUrl); this.audioUrl = null; }
+    if (this.utter) {
+      this.utter = null;
+      try { window.speechSynthesis.cancel(); } catch { /* ignore */ }
+    }
+    this.bubble = null;
   },
 
   // Heard part of an audio reply: cut the text at the played fraction, back to a word boundary.
@@ -536,21 +879,23 @@ const Voice = {
     return cut.replace(/\s*\S*$/, "").trim();
   },
 
-  speakBrowser(text, bubble, ended) {
-    if (!window.speechSynthesis) return;
+  speakBrowser(text, bubble, ended, prefix = "") {
+    // No way to speak: a reply that ended the call must still stop the mic.
+    const giveUp = () => { if (ended) setTimeout(() => this.stop(), 0); };
+    if (!window.speechSynthesis) return giveUp();
     const voice = this.pickVoice();
     if (!voice) {
       if (!this.noVoiceSaid) {
         this.noVoiceSaid = true;
         this.note("No on-device voice found, so replies are text only.");
       }
-      return;
+      return giveUp();
     }
-    this.cancelSpeech(false);
+    this.stopReply();
     const u = new SpeechSynthesisUtterance(text);
     u.voice = voice;
     u.lang = voice.lang;
-    this.utter = u; this.bubble = bubble; this.fullText = text; this.charIndex = 0; this.endAfter = !!ended;
+    this.utter = u; this.bubble = bubble; this.fullText = text; this.prefix = prefix; this.charIndex = 0; this.endAfter = !!ended;
     u.onboundary = (ev) => { if (this.utter === u) this.charIndex = ev.charIndex; };
     const done = () => {
       if (this.utter !== u) return;
@@ -564,29 +909,39 @@ const Voice = {
     this.applyMute();
   },
 
+  // Heard part of a queued reply: fully played sentences plus the played fraction of the current one.
+  heardFromQueue(q) {
+    const parts = [...q.played];
+    const item = q.items[q.pos];
+    if (this.audio && item) parts.push(this.heardFromAudio(this.audio, item.text));
+    return parts.join(" ").trim();
+  },
+
   // Stop speech. interrupted=true records the heard part for the next message (3b, 3c).
+  // An interruption during the ack records an empty heard text: the caller heard none of the reply.
   cancelSpeech(interrupted) {
-    const a = this.audio;
-    if (a || this.fetching) {
-      this.ticket++; // drop a fetch still in flight
-      this.fetching = false;
-      if (interrupted) pendingHeard = a ? this.heardFromAudio(a, this.fullText) : "";
-      this.clearAudio();
+    const acked = !!this.ack;
+    this.stopAck();
+    this.deferred = null;
+    const q = this.q;
+    if (q) {
+      if (interrupted) pendingHeard = acked ? "" : this.heardFromQueue(q);
+      const bubble = this.bubble;
+      this.stopReply();
       this.applyMute();
-      if (interrupted && this.bubble) {
-        this.bubble.classList.add("was-interrupted");
-        this.bubble.appendChild(el("span", "interrupted", "(interrupted)"));
+      if (interrupted && bubble) {
+        bubble.classList.add("was-interrupted");
+        bubble.appendChild(el("span", "interrupted", "(interrupted)"));
       }
-      this.bubble = null;
       return;
     }
     const u = this.utter;
-    if (!u) { try { window.speechSynthesis?.cancel(); } catch { /* ignore */ } return; }
+    if (!u) { try { window.speechSynthesis?.cancel(); } catch { /* ignore */ } this.bubble = null; return; }
     this.utter = null;
     try { window.speechSynthesis.cancel(); } catch { /* ignore */ }
     this.applyMute();
     if (interrupted) {
-      pendingHeard = this.fullText.slice(0, this.charIndex).trim();
+      pendingHeard = `${this.prefix} ${this.fullText.slice(0, this.charIndex)}`.trim();
       if (this.bubble) {
         this.bubble.classList.add("was-interrupted");
         this.bubble.appendChild(el("span", "interrupted", "(interrupted)"));
