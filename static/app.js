@@ -263,7 +263,7 @@ async function loadConfig() {
       badge.textContent = "offline test mode (FakeLLM)";
       $("apiKey").placeholder = "not needed in test mode";
     } else {
-      badge.textContent = cfg.model;
+      badge.textContent = `${cfg.provider}: ${cfg.extract_model} reads, ${cfg.respond_model} replies` + (cfg.effort ? ` (${cfg.effort})` : "");
       if (cfg.server_has_key) $("apiKey").placeholder = "optional: server has a key";
     }
     if (cfg.today) {
