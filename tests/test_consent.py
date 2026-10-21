@@ -123,3 +123,28 @@ def test_second_claim_needs_a_new_consent_request(env):
     assert s.consent_status == "approved"
     requests = [e for res in r + r2 + r3 for e in res["events"] if e.get("name") == "request_consent"]
     assert len(requests) == 2
+
+
+class SpyLLM(FakeLLM):
+    """FakeLLM that records the system prompt of every extract call."""
+
+    def __init__(self):
+        super().__init__()
+        self.systems: list[str] = []
+
+    def extract(self, system, user):
+        self.systems.append(system)
+        return super().extract(system, user)
+
+
+def test_extract_sees_no_claims_for_a_representative_until_approval():
+    agent, llm = Agent(DataStore(), []), SpyLLM()
+    s = Session("t")
+    for m in (DAVID, "Why was claim CL-2048 denied?", "Any update?", "Thanks."):
+        agent.handle(s, m, llm)
+    # Verified but unapproved: no claims list in the prompts of turns 2 and 3.
+    assert "claims on file" not in llm.systems[1] and "claims on file" not in llm.systems[2]
+    # After approval only the approved claim is shown.
+    assert s.consent_status == "approved"
+    assert "claims on file" in llm.systems[3] and '"case_id": "CL-2048"' in llm.systems[3]
+    assert "CL-2011" not in llm.systems[3] and "CL-1899" not in llm.systems[3]

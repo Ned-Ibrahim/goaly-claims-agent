@@ -44,7 +44,6 @@ Intent = Literal[
 ]
 ClaimType = Literal["healthcare", "auto", "home", "life", "dental", "other"]
 ClaimStatus = Literal["open", "closed", "denied"]
-Emotion = Literal["neutral", "frustrated", "anxious", "angry", "confused"]
 YesNo = Literal["yes", "no", "unclear", "none"]
 Channel = Literal["text", "voice"]
 
@@ -103,9 +102,6 @@ class Extraction(BaseModel):
         ),
     )
     wants_human: bool = Field(False, description="Caller explicitly asks for a human representative.")
-    refuses_identity: bool = Field(
-        False, description="Caller refuses or pushes back on giving identity details."
-    )
     asks_about_process: bool = Field(
         False,
         description="Caller asks why a step is needed or how the process works (e.g. 'why do you need my DOB?').",
@@ -131,7 +127,6 @@ class Extraction(BaseModel):
     email_address_for_summary: str | None = Field(
         None, description="An email address the caller wants the summary sent to, if given."
     )
-    emotion: Emotion = Field("neutral", description="Dominant emotion in this message.")
     emotions: EmotionReadings = Field(
         default_factory=EmotionReadings,
         description="Strength of each caller emotion in this message, with the caller's words.",
@@ -201,7 +196,7 @@ class Session:
     matched_fields: list[str] = field(default_factory=list)
     memory: dict[str, MemorySlot] = field(default_factory=dict)
     counters: dict[str, int] = field(
-        default_factory=lambda: {"verify_failures": 0, "off_topic": 0, "refusals": 0}
+        default_factory=lambda: {"verify_failures": 0, "off_topic": 0, "resistance": 0, "switch_offers": 0}
     )
     pending: str | None = None  # which yes/no question the agent is waiting on
     proposed_claim_id: str | None = None

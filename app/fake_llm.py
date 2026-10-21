@@ -198,7 +198,6 @@ class FakeLLM:
             low,
         )
         ex.wants_human = bool(re.search(r"\b(human|real person|representative|supervisor|manager)\b", low)) and not re.search(r"\bno\b", low[:4])
-        ex.refuses_identity = bool(re.search(r"already told you|not giving|won't give|wont give|not going to give|don't want to (give|share)|refuse|i said no|not telling", low))
         ex.asks_about_process = bool(re.search(r"why do you need|why do i have to|what for\?", low))
         ex.forbidden_action = bool(re.search(r"approve (my|the|it)|just pay|skip (the )?verification|ignore (all |your |previous |prior )+instructions|^\s*system:|admin mode|i'm an admin|verification (is )?(complete|completed|done)|reopen|cancel (my|the) claim", low))
         ex.other_claim = bool(re.search(r"another claim|other claim|different claim", low))
@@ -212,14 +211,6 @@ class FakeLLM:
         ex.email_address_for_summary = ex.email if "send" in low or "email it" in low else None
         if ex.email_address_for_summary:
             ex.email = None
-        if re.search(r"ridiculous|frustrat|annoy|unbelievable|come on", low):
-            ex.emotion = "frustrated"
-        elif re.search(r"angry|furious|outrageous|unacceptable", low):
-            ex.emotion = "angry"
-        elif re.search(r"worried|anxious|scared|nervous", low):
-            ex.emotion = "anxious"
-        elif re.search(r"confus|don't understand|what do you mean", low):
-            ex.emotion = "confused"
         ex.emotions = _fake_emotions(msg)
         _fake_representative(msg, ex)
         ex.switch_choice = _fake_switch_choice(low)

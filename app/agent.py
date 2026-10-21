@@ -50,7 +50,7 @@ class Agent:
             s.transcript.append({"role": "assistant", "content": plan.static_reply})
             return self.result(s, plan.static_reply, None, vals)
 
-        claims = self.store.list_claims(s.customer_id) if s.verified else None
+        claims = self._claims_for_extract(s)
         system = self._clean(s, extractor_system(claims), vals, "extract_system")
         user = self._clean(s, extractor_user(s.transcript, masked), vals, "extract_user")
         try:
@@ -75,6 +75,18 @@ class Agent:
         stored = plan.transcript_text or reply
         s.transcript.append({"role": "assistant", "content": stored})
         return self.result(s, reply, ex, vals, readback=bool(plan.transcript_text))
+
+    def _claims_for_extract(self, s: Session) -> list[dict] | None:
+        """Claims the extract model may see. A representative sees none until the policyholder
+        approves a claim, and then only that claim (decision 8a)."""
+        if not s.verified:
+            return None
+        claims = self.store.list_claims(s.customer_id)
+        if s.caller_role != "representative":
+            return claims
+        if s.consent_status == "approved" and s.consent_claim_id:
+            return [c for c in claims if c["case_id"] == s.consent_claim_id]
+        return None
 
     # ---- identity values and the egress check ---------------------------------
 
