@@ -46,6 +46,25 @@ ClaimType = Literal["healthcare", "auto", "home", "life", "dental", "other"]
 ClaimStatus = Literal["open", "closed", "denied"]
 Emotion = Literal["neutral", "frustrated", "anxious", "angry", "confused"]
 YesNo = Literal["yes", "no", "unclear", "none"]
+Channel = Literal["text", "voice"]
+
+# Emotion readings (decisions 11a, 11b). Each caller message gets a strength for each of
+# the five caller emotions, with the caller's own words as evidence. See CONTEXT.md.
+EmotionLevel = Literal["none", "mild", "strong"]
+EMOTIONS = ("frustration", "anger", "anxiety", "confusion", "refusal")
+
+
+class EmotionReading(BaseModel):
+    level: EmotionLevel = "none"
+    words: str | None = Field(None, description="The caller's own words that show it, quoted.")
+
+
+class EmotionReadings(BaseModel):
+    frustration: EmotionReading = Field(default_factory=EmotionReading)
+    anger: EmotionReading = Field(default_factory=EmotionReading)
+    anxiety: EmotionReading = Field(default_factory=EmotionReading)
+    confusion: EmotionReading = Field(default_factory=EmotionReading)
+    refusal: EmotionReading = Field(default_factory=EmotionReading)
 
 
 class Extraction(BaseModel):
@@ -113,6 +132,10 @@ class Extraction(BaseModel):
         None, description="An email address the caller wants the summary sent to, if given."
     )
     emotion: Emotion = Field("neutral", description="Dominant emotion in this message.")
+    emotions: EmotionReadings = Field(
+        default_factory=EmotionReadings,
+        description="Strength of each caller emotion in this message, with the caller's words.",
+    )
     question: str | None = Field(
         None, description="The caller's actual question in this message, restated briefly, if any."
     )
@@ -147,6 +170,7 @@ class CaseRecord:
 class Session:
     session_id: str
     phase: Phase = Phase.VERIFY_ID
+    channel: Channel = "text"  # how the latest caller message arrived
     turn: int = 0
     transcript: list[dict[str, str]] = field(default_factory=list)
     # Raw identity values live only server side; memory shows masked values.
