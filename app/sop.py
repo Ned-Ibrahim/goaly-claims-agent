@@ -142,6 +142,8 @@ def _digit_words(v: str) -> str:
 
 def _spoken(field: str, value: str) -> str:
     """One identity value as the voice should say it: digits one by one, dates in words."""
+    if field == "full_name":
+        return f"the name {value}"
     if field == "id_last4":
         return f"ID ending {_digit_words(value)}"
     if field == "phone":
@@ -502,6 +504,9 @@ class SOPController:
                 fresh = [f for f in READBACK_FIELDS if f in s.readback_fields or f in fresh]
         if not fresh:
             return None
+        if s.identity.get("full_name") and "full_name" not in fresh:
+            # A misheard name fails the check like any other detail, so it is read back with the rest.
+            fresh = ["full_name", *fresh]
         s.readback_fields, s.pending = fresh, "readback"
         self.ev(s, "gate", name="readback", passed=None, detail="read back before the check")
         p.phase = Phase.VERIFY_ID
@@ -513,7 +518,7 @@ class SOPController:
     def _readback_line(s: Session, fields: list[str], masked: bool) -> str:
         parts = []
         for f in fields:
-            if masked:
+            if masked and f != "full_name":  # the model sees names (ADR 0003), so the name is not masked
                 parts.append(READBACK_PLACEHOLDERS[f])
             else:
                 parts.append(_spoken(f, s.identity.get(f, "")))
