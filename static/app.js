@@ -348,7 +348,6 @@ async function loadConfig() {
       if (cfg.server_has_key) $("apiKey").placeholder = "optional: server has a key";
     }
     ttsMode = cfg.tts === "kokoro" ? "kokoro" : "browser";
-    if (ttsMode === "kokoro") prefetchAcks();
     if (cfg.today) {
       $("asof").textContent = `data date ${cfg.today}`;
       $("asof").hidden = false;
@@ -369,30 +368,12 @@ const VAD_END_FLOOR_MS = 200;     // never flush sooner than this after speech e
 const VAD_FLUSH_LATE_MS = 150;    // flush this long after a final result that arrives after the VAD end
 const ORT_BASE = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
 const VAD_BASE = "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.31/dist/";
-const ACKS = ["Okay.", "Got it.", "Alright.", "Sure."];
 const MIN_SENTENCE = 25;
 const MAX_TTS_INFLIGHT = 2;
 
 let ttsMode = "browser"; // "kokoro" when the server can speak (config)
 let pendingHeard = null; // spoken part of an interrupted reply, sent with the next message
 function takeHeard() { const h = pendingHeard; pendingHeard = null; return h; }
-
-// Acknowledgment clips for kokoro, fetched once after config tells us the server can speak.
-const ackUrls = new Map();
-let ackIdx = -1;
-async function prefetchAcks() {
-  for (const text of ACKS) {
-    if (ackUrls.has(text)) continue;
-    try {
-      const res = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-      if (res.ok) ackUrls.set(text, URL.createObjectURL(await res.blob()));
-    } catch { /* no ack for this clip */ }
-  }
-}
 
 // End at . ? ! followed by space or end; a piece under MIN_SENTENCE chars joins the next one.
 function splitSentences(text) {
@@ -411,7 +392,7 @@ function splitSentences(text) {
 const Voice = {
   on: false, rec: null, stream: null, track: null,
   buffer: "", timer: null, silenceMs: SILENCE_MS,
-  utter: null, audio: null, q: null, ack: null, deferred: null, bubble: null, fullText: "", charIndex: 0, endAfter: false,
+  utter: null, audio: null, q: null, bubble: null, fullText: "", charIndex: 0, endAfter: false,
   noVoiceSaid: false, prefix: "", usable: false, ticket: 0,
   vad: null, vadEnded: false, vadEndAt: 0, interim: "", asksNumber: false,
 
@@ -545,7 +526,7 @@ const Voice = {
     this.note("");
   },
 
-  get speaking() { return !!(this.utter || this.audio || this.ack); },
+  get speaking() { return !!(this.utter || this.audio); },
   get fetching() { return !!this.q && !this.audio; },
   get muted() { return $("pauseMic").checked && this.speaking; },
 
@@ -650,58 +631,8 @@ const Voice = {
     this.buffer = ""; this.interim = ""; this.vadEnded = false;
     $("mic").classList.remove("heard");
     clearInterim();
-    if ((this.speaking || this.fetching) && !this.ack) this.cancelSpeech(true);
-    this.playAck();
+    if (this.speaking || this.fetching) this.cancelSpeech(true);
     send(text, "voice");
-  },
-
-  // Short canned clip so the caller hears something while the model works. Not shown in the log.
-  playAck() {
-    if (!this.on || this.utter || this.audio || this.q) return;
-    this.stopAck();
-    ackIdx = (ackIdx + 1) % ACKS.length;
-    const text = ACKS[ackIdx];
-    if (ttsMode === "kokoro") {
-      const url = ackUrls.get(text);
-      if (!url) return;
-      const a = new Audio(url);
-      const done = () => this.ackDone(a);
-      a.onended = done;
-      a.onerror = done;
-      this.ack = a;
-      a.play().catch(done);
-    } else {
-      const voice = window.speechSynthesis && this.pickVoice();
-      if (!voice) return;
-      const u = new SpeechSynthesisUtterance(text);
-      u.voice = voice;
-      u.lang = voice.lang;
-      u.onend = () => this.ackDone(u);
-      u.onerror = () => this.ackDone(u);
-      this.ack = u;
-      window.speechSynthesis.speak(u);
-    }
-    this.applyMute();
-  },
-
-  stopAck() {
-    const x = this.ack;
-    if (!x) return;
-    this.ack = null;
-    if (x instanceof Audio) { x.onended = null; x.onerror = null; try { x.pause(); } catch { /* ignore */ } }
-    else { try { window.speechSynthesis.cancel(); } catch { /* ignore */ } }
-    this.applyMute();
-  },
-
-  // The reply waits for the ack to finish rather than cutting it off.
-  ackDone(x) {
-    if (this.ack !== x) return;
-    this.ack = null;
-    this.applyMute();
-    const d = this.deferred;
-    this.deferred = null;
-    if (d) this.speakBrowser(...d);
-    else this.tryPlay();
   },
 
   reset() {
@@ -726,7 +657,6 @@ const Voice = {
     this.setAsks(text);
     if (!this.on) return;
     if (ttsMode === "kokoro") return this.speakServer(text, bubble, ended);
-    if (this.ack) { this.deferred = [text, bubble, ended]; return; } // browser ack still talking
     this.speakBrowser(text, bubble, ended);
   },
 
@@ -810,7 +740,7 @@ const Voice = {
   // Play the next sentence if it is ready and nothing else is speaking.
   tryPlay() {
     const q = this.q;
-    if (!q || this.ack || this.audio) return;
+    if (!q || this.audio) return;
     if (q.pos >= q.items.length) { if (q.finished) this.replyDone(); return; }
     const item = q.items[q.pos];
     if (item.state === "failed") return this.fallbackBrowser();
@@ -855,7 +785,7 @@ const Voice = {
     this.speakBrowser(rest, bubble, endAfter, prefix);
   },
 
-  // Drop the current reply (audio, queue, browser utterance) but leave any ack alone.
+  // Drop the current reply (audio, queue, browser utterance).
   stopReply() {
     this.ticket++;
     const q = this.q;
@@ -918,14 +848,10 @@ const Voice = {
   },
 
   // Stop speech. interrupted=true records the heard part for the next message (3b, 3c).
-  // An interruption during the ack records an empty heard text: the caller heard none of the reply.
   cancelSpeech(interrupted) {
-    const acked = !!this.ack;
-    this.stopAck();
-    this.deferred = null;
     const q = this.q;
     if (q) {
-      if (interrupted) pendingHeard = acked ? "" : this.heardFromQueue(q);
+      if (interrupted) pendingHeard = this.heardFromQueue(q);
       const bubble = this.bubble;
       this.stopReply();
       this.applyMute();

@@ -30,6 +30,8 @@ uv run uvicorn app.server:app --port 8000
 You can also leave the key out of `.env` and paste it into the field at the top of the page.
 The page sends it as an `X-API-Key` header, and the server does not store or log it.
 
+To run on OpenAI instead, start the server with `CLAIMS_PROVIDER=openai CLAIMS_EXTRACT_MODEL=gpt-4.1-mini CLAIMS_RESPOND_MODEL=gpt-4.1-mini` and paste an OpenAI key.
+
 ### With Docker
 
 Fake mode, no key:
@@ -51,6 +53,11 @@ On first use the page offers to install the on-device language pack (the "Instal
 If on-device recognition is not available, voice stays off and the page says why.
 Recognition runs on the device and replies are spoken with a local system voice, so neither the caller's audio nor the spoken reply goes to a speech service.
 Microphone access works on `localhost` without HTTPS.
+
+Turn-taking uses Silero VAD in the browser (`@ricky0123/vad-web` 0.0.31, loaded from jsdelivr; the audio stays on the device).
+About 0.3 s of real speech interrupts the agent, so a cough or a short "mm" does not.
+The caller's turn ends about 0.9 s after they stop talking, or about 2.1 s after a question that asks for a date, phone, email or digits.
+Voice turns use `POST /api/chat/stream`: the reply streams from the model, each sentence passes the same gates before it is sent, and the page speaks it while the next one is written.
 
 #### Natural voice (optional)
 
@@ -167,14 +174,15 @@ python3 evals/run_evals.py --mode fake             # scenarios against the runni
 ```
 
 In fake mode all 46 scenarios pass, and so does the consent timeout scenario (start the server with `CLAIMS_CONSENT_SCENARIO=timeout` and add `--consent-scenario timeout`).
-Nothing has run against a live model yet, so no live results are claimed here.
+The live models were tried by hand in the browser (Claude Haiku 5.5 and OpenAI GPT-4.1 mini); the eval suite has not been run against a live model, so no live scores are claimed here.
 With a key, `python3 evals/run_evals.py --simulate --k 5` plays a model-written caller five times per scenario and scores pass^5.
 See `evals/README.md` for the options.
 
 ## Known limits
 
-- The agent has not run against a live model yet. Every result above comes from the deterministic stand-in.
-- Voice mode has not been tested with a real microphone. Echo cancellation during an Interruption is the part most likely to need the "Pause mic while agent speaks" fallback.
+- Every scored result above comes from the deterministic stand-in; live runs were by hand only.
+- Voice was tried by hand with a real microphone. With Claude Haiku 5.5 at low effort, the first spoken sentence came 1.8 to 3.8 s after the caller's turn ended (3 turns, measured in the browser). The VAD thresholds are not tuned yet.
+- A speech-to-speech model (such as OpenAI Realtime) would sound more natural, but it hears the caller's raw audio, identity details included, and speaks before code can check a sentence. That is why it is not the default here.
 - Presidio is optional and stays off unless installed with the `presidio` extra. Without it, the parser's own patterns and the fail-closed sweep do the work.
 - When a Representative describes a claim instead of giving its number, a hint that matches one claim starts a Consent request, while a hint that matches none gets "which claim number?". That difference tells the caller whether a matching claim exists.
 
