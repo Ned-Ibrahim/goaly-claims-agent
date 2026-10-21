@@ -97,3 +97,51 @@ def test_trace_has_events_and_no_identity(agent, tmp_path, monkeypatch):
     for key in ("dob", "id_last4", "email"):
         assert p9[key] not in text
     assert p9["phone"][-10:] not in text
+
+
+class _SpyLLM(FakeLLM):
+    def __init__(self):
+        self.extract_users: list[str] = []
+
+    def extract(self, system, user):
+        self.extract_users.append(user)
+        return super().extract(system, user)
+
+
+def test_extract_history_starts_at_the_switch(agent, tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAIMS_TRACE_DIR", str(tmp_path))
+    s, llm = Session("m6"), _SpyLLM()
+    agent.handle(s, "Hi, " + HINT, llm)
+    memory.clear_person(s)
+    agent.handle(s, "Hello there", llm)
+    assert "January" not in llm.extract_users[-1]
+    assert "(start of call)" in llm.extract_users[-1]
+
+
+def test_clear_person_resets_case_and_representative_state(agent, tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAIMS_TRACE_DIR", str(tmp_path))
+    s = Session("m7")
+    s.case.claims_discussed.append("CL-2048")
+    s.case.paths_taken.append("claim_status")
+    s.case.caller_questions.append("why?")
+    s.caller_role, s.rep_name, s.rep_relationship = "representative", "Sam", "son"
+    s.consent_claim_id, s.consent_status, s.consent_checks = "CL-2048", "approved", 2
+    s.emotion_log.append({"x": 1})
+    s.counters["resistance"] = 1
+    memory.clear_person(s)
+    assert (s.case.claims_discussed, s.case.paths_taken, s.case.caller_questions) == ([], [], [])
+    assert s.caller_role == "policyholder" and s.rep_name is None and s.rep_relationship is None
+    assert s.consent_claim_id is None and s.consent_status is None and s.consent_checks == 0
+    assert s.counters["resistance"] == 1 and s.emotion_log == [{"x": 1}]
+
+
+def test_deferred_question_and_lost_document_pick_the_guideline_answer(agent, tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAIMS_TRACE_DIR", str(tmp_path))
+    s, llm = Session("m8"), FakeLLM()
+    agent.handle(
+        s, "I have a denied healthcare claim from January. What if I lost the pathology report?", llm
+    )
+    r = agent.handle(s, ID_MSG, llm)
+    r = agent.handle(s, "yes", llm) if s.phase.value != "PROCESS_CASE" else r
+    assert s.phase.value == "PROCESS_CASE"
+    assert any(e.get("name") == "get_followup_guidance" for e in s.turn_events + r["events"])

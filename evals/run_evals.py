@@ -600,9 +600,10 @@ def main() -> int:
                        f"{problems} fail, {warns} warn |")
         if res.status in ("FAIL", "ERROR"):
             worst = 1
-    by_tag = tag_table(runs)
-    print("\n" + "\n".join(by_tag))
-    summary += ["", "## Checklist results by tag", ""] + by_tag
+    if CHECKLIST.exists():  # the checklist lives outside the repo; without it the tag table would be all zeros
+        by_tag = tag_table(runs)
+        print("\n" + "\n".join(by_tag))
+        summary += ["", "## Checklist results by tag", ""] + by_tag
     summary += ["", "## Coverage", ""] + print_coverage(selected)
     (out_dir / "summary.md").write_text("\n".join(summary) + "\n")
     counts = {lvl: sum(1 for _, r in runs if r.status == lvl) for lvl in ("PASS", "WARN", "FAIL", "ERROR")}

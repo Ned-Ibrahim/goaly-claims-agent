@@ -86,6 +86,17 @@ def test_timeout_never_discloses_and_offers_a_human(env, monkeypatch):
     assert r2[0]["phase"] == "HANDOFF" and no_claim_facts(r2[0]["reply"])
 
 
+def test_timed_out_claim_is_not_re_requested(env, monkeypatch):
+    monkeypatch.setenv("CLAIMS_CONSENT_SCENARIO", "timeout")
+    s, r = run(env, DAVID, "Why was claim CL-2048 denied?", *["Any news?"] * 4)
+    assert s.consent_status == "timeout"
+    s, r2 = run(env, "Tell me about CL-2048 again", "Any news on CL-2048?", session=s)
+    assert s.consent_status == "timeout" and s.consent_checks == 5
+    assert s.pending == "handoff_offer" and s.selected_claim_id is None
+    for res in r2:
+        assert no_claim_facts(res["reply"], allow=("CL-2048",))
+
+
 def test_unlisted_caller_with_correct_details_gets_a_handoff(env):
     s, r = run(env, NEIGHBOR)
     assert r[0]["phase"] == "HANDOFF"

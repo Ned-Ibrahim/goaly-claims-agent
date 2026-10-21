@@ -33,10 +33,8 @@ STATUS_WORDS = {
 }
 
 
-def compose_summary(store: DataStore, s: Session, to: str | None = None) -> dict:
+def compose_summary(store: DataStore, s: Session) -> dict:
     """Decision 8b: the summary goes only to the email on the policyholder's file.
-
-    `to` is accepted for callers that pass it, but any other address is ignored.
     """
     to = store.customer(s.customer_id)["email"]
     first = store.first_name(s.customer_id)

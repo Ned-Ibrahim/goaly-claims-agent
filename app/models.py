@@ -203,7 +203,6 @@ class Session:
     memory_hints_used: bool = False
     selected_claim_id: str | None = None
     path: str | None = None
-    email_to: str | None = None
     case: CaseRecord = field(default_factory=CaseRecord)
     handoff_packet: dict[str, Any] | None = None
     turn_events: list[dict[str, Any]] = field(default_factory=list)

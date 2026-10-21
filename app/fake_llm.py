@@ -38,7 +38,7 @@ _EMOTION_PATTERNS = [
     ("frustration", "mild", r"already told you|ridiculous|just tell me|frustrat|annoy|unbelievable|come on"),
     ("anxiety", "mild", r"worried|scared|anxious|nervous|can't afford|cant afford|deadline"),
     ("confusion", "mild", r"what do you mean|i don't understand|i dont understand|confus"),
-    ("refusal", "strong", r"not giving you|won't give|wont give|i'm not telling|im not telling|not going to give|i refuse"),
+    ("refusal", "strong", r"not giving you|won't give|wont give|i'm not telling|im not telling|not going to give|i refuse|i said no|still not (?:telling|giving)|not telling you"),
     ("refusal", "mild", r"why do you need|why do i have to"),
 ]
 
@@ -54,6 +54,14 @@ def _fake_emotions(text: str) -> EmotionReadings:
         if m:
             out[name] = EmotionReading(level=level, words=m.group(0))
     return EmotionReadings(**out)
+
+
+def _fake_question_answer(question: str, data: str) -> str:
+    """A grounded one-line answer for a free question: the appeal deadline if shown, else an honest gap."""
+    deadline = _find(r'"appeal_deadline": "([^"]+)"', data, 0)
+    if deadline and re.search(r"deadline|by when", question):
+        return f"The appeal deadline is {deadline}."
+    return "I don't have that information here, but I can connect you with a human representative."
 
 
 def _fake_switch_choice(low: str) -> str:
@@ -200,7 +208,7 @@ class FakeLLM:
         ex.wants_human = bool(re.search(r"\b(human|real person|representative|supervisor|manager)\b", low)) and not re.search(r"\bno\b", low[:4])
         ex.asks_about_process = bool(re.search(r"why do you need|why do i have to|what for\?", low))
         ex.forbidden_action = bool(re.search(r"approve (my|the|it)|just pay|skip (the )?verification|ignore (all |your |previous |prior )+instructions|^\s*system:|admin mode|i'm an admin|verification (is )?(complete|completed|done)|reopen|cancel (my|the) claim", low))
-        ex.other_claim = bool(re.search(r"another claim|other claim|different claim", low))
+        ex.other_claim = bool(re.search(r"another claim|other claim|different claim|\balso\b.*\b(auto|home|dental)\b.*claim", low))
         ex.done = bool(re.search(r"that's all|thats all|nothing else|i'm good|im good|that is all|no more questions", low))
         if re.search(r"^\s*(yes|yeah|yep|sure|please do|go ahead|ok|okay|correct|that's (it|the one|right))\b", low):
             ex.yes_no = "yes"
@@ -248,6 +256,9 @@ class FakeLLM:
         if "which documents this claim needs" in plan:
             docs = re.findall(r'"document": "([^"]+)"', data)
             parts.append(f"This claim needs: {', '.join(docs)}." if docs else "This claim doesn't need any documents.")
+        asked = re.search(r'Answer the caller\'s question \("([^"]*)"\)', plan)
+        if asked:
+            parts.append(_fake_question_answer(asked.group(1).lower(), data))
         if "set answer for this follow-up" in plan:
             parts.append(_find(r'"answer": "([^"]+)"', data, 0) or "")
         if "offer to email a summary" in plan:

@@ -273,9 +273,9 @@ def test_grounding_ignores_caller_asserted_numbers():
     assert grounding_check("A decision takes about 60 days", {"ref": ["decided within 30 days"]}) == ["60 days"]
 
 
-def test_off_topic_streak_resets_on_progress(env):
+def test_off_topic_count_is_per_call_and_survives_progress(env):
     _, r = run(env, "what is RL?", "what is RL?", MARGARET)
-    assert r[2]["counters"]["off_topic"] == 0
+    assert r[2]["counters"]["off_topic"] == 2
 
 
 def test_summary_goes_only_to_the_address_on_file(env):

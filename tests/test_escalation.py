@@ -170,13 +170,13 @@ def test_summary_goes_only_to_the_address_on_file(env):
     assert [e["to"] for e in outbox] == ["margaret@email.com"]
 
 
-def test_compose_summary_ignores_any_other_address(env):
+def test_compose_summary_uses_the_address_on_file(env):
     agent, _, _ = env
     from app.emailer import compose_summary
 
     s = Session("t")
     s.customer_id = "P9"
-    assert compose_summary(agent.store, s, "attacker@else.com")["to"] == "margaret@email.com"
+    assert compose_summary(agent.store, s)["to"] == "margaret@email.com"
 
 
 def test_representative_is_told_it_goes_to_the_file_address(env):
@@ -218,3 +218,16 @@ def test_money_is_added_when_the_caller_asks(env):
     run(env, "How much will I be paid?", session=s)
     data = allowed_data(llm)
     assert "net_pay" in data["claim"] and "amount_meanings" in data
+
+
+def test_unconsented_representative_gets_the_disclosure_filter(env):
+    agent, _, _ = env
+    s = Session("t")
+    s.verified, s.customer_id = True, "P9"
+    s.caller_role, s.consent_status = "representative", "pending"
+    assert agent._nothing_disclosable(s) and agent._guard_name(s) == "disclosure_filter"
+    s.consent_status = "approved"
+    assert not agent._nothing_disclosable(s) and agent._guard_name(s) == "grounding"
+    s.caller_role = "policyholder"
+    s.consent_status = None
+    assert agent._guard_name(s) == "grounding"

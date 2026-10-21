@@ -203,8 +203,6 @@ class SOPController:
 
     def transition(self, s: Session, to: Phase) -> None:
         self.ev(s, "transition", **{"from": s.phase.value, "to": to.value})
-        if PHASE_ORDER.get(to, -1) > PHASE_ORDER.get(s.phase, -1):
-            s.counters["off_topic"] = 0  # real progress resets the off-topic streak
         s.phase = to
 
     # ---- entry point -----------------------------------------------------
@@ -374,7 +372,7 @@ class SOPController:
             "customer_id": s.customer_id if s.verified else None,
             "matched_fields": list(s.matched_fields),
             "phase_at_handoff": s.phase.value,
-            "memory": {k: v for k, v in memory.snapshot(s).items() if not k.startswith("id.")},
+            "memory": {k: v for k, v in memory.snapshot(s).items() if not k.startswith("id.") and k != "email_address"},
             "claims_discussed": list(s.case.claims_discussed),
             "counters": dict(s.counters),
             "emotions": readings,
@@ -792,9 +790,12 @@ class SOPController:
         deferred = s.memory.get("deferred_question")
         if entering and deferred is not None:
             p.say(f"Earlier, before verification, the caller asked: \"{deferred.value}\". Make sure this reply answers it.")
-        followup = guidelines.followup_answer(
-            g, claim, f"{_last_caller_text(s)} {ex.question or ''}", ex.lacks_document
-        )
+        followup_text = f"{_last_caller_text(s)} {ex.question or ''}"
+        lacks_document = ex.lacks_document
+        if entering:  # words and flags from before verification count too
+            followup_text += f" {deferred.value}" if deferred is not None else ""
+            lacks_document = lacks_document or s.memory.get("deferred_lacks_document") is not None
+        followup = guidelines.followup_answer(g, claim, followup_text, lacks_document)
         if followup:
             self.ev(s, "tool_call", name="get_followup_guidance", topic=followup["topic"])
             p.data["guideline_answer"] = followup
@@ -802,7 +803,7 @@ class SOPController:
                 "The company has a set answer for this follow-up (guideline_answer). Give it in your "
                 "own words, keeping every fact and timeframe in it unchanged."
             )
-            if ex.lacks_document:
+            if lacks_document:
                 p.data["if_alternatives_fail"] = guidelines.human_review_note(g)
         elif ex.question and (deferred is None or ex.question != deferred.value):
             if claim.get("documents_needed"):
@@ -874,7 +875,7 @@ class SOPController:
     def _send_and_close(self, s: Session, p: Plan, to: str) -> Plan:
         self.ev(s, "gate", name="email_consent", passed=True, detail="caller chose to send")
         self.ev(s, "tool_call", name="send_email")
-        email = compose_summary(self.store, s, to)
+        email = compose_summary(self.store, s)
         self.outbox.append(email)
         masked = memory.mask("email", to)
         self.ev(s, "email_sent", to=masked)
@@ -994,6 +995,14 @@ class SOPController:
             return p
         if s.consent_status == "approved" and s.consent_claim_id == claim_id:
             return self._select(s, ex, p, claim_id)
+        if s.consent_status == "timeout" and s.consent_claim_id == claim_id:
+            # 8c: a timed-out claim is not re-requested; only a different claim starts a new request.
+            p.say(
+                "The policyholder's approval did not come back. Disclose nothing and offer a "
+                "human representative."
+            )
+            s.pending = "handoff_offer"
+            return p
         return self._rep_request(s, ex, p, claim_id, named)
 
     def _rep_request(self, s: Session, ex: Extraction, p: Plan, claim_id: str, named: bool) -> Plan:

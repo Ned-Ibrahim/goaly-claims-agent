@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .models import Extraction, MemorySlot, Session
+from .models import CaseRecord, Extraction, MemorySlot, Session
 
 
 def mask(field: str, value: str) -> str:
@@ -101,6 +101,8 @@ def write(session: Session, ex: Extraction, utterance: str) -> list[str]:
         written.append(
             _put(session, "email_address", mask("email", ex.email_address_for_summary.strip().lower()), quote)
         )
+    if ex.lacks_document and session.phase.value == "VERIFY_ID":
+        written.append(_put(session, "deferred_lacks_document", True, quote))
     if ex.question and session.phase.value == "VERIFY_ID" and (
         ex.intent != "none" or ex.claim_id or ex.claim_type or ex.claim_status_hint
     ):
@@ -150,7 +152,6 @@ _USABLE_WHEN_VERIFIED = (
     "intent", "claim_type", "claim_month", "claim_year",
     "claim_status_hint", "claim_id_hint", "deferred_question",
 )
-_PERSON_SLOTS = ("deferred_question",)
 
 
 def _usable(s: Session, slot: str) -> bool:
@@ -188,6 +189,13 @@ def clear_person(s: Session, keep_claim_id: str | None = None) -> None:
     s.pending = None
     s.readback_fields = []
     s.memory_hints_used = False
+    s.case = CaseRecord()
+    s.caller_role = "policyholder"
+    s.rep_name = None
+    s.rep_relationship = None
+    s.consent_claim_id = None
+    s.consent_status = None
+    s.consent_checks = 0
     s.window_start = len(s.transcript)
     if keep_claim_id:
         _put(s, "claim_id_hint", keep_claim_id.strip().upper(), "[claim the caller asked for]")

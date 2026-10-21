@@ -52,7 +52,7 @@ class Agent:
 
         claims = self._claims_for_extract(s)
         system = self._clean(s, extractor_system(claims), vals, "extract_system")
-        user = self._clean(s, extractor_user(s.transcript, masked), vals, "extract_user")
+        user = self._clean(s, extractor_user(memory.recent_turns(s, 8), masked), vals, "extract_user")
         try:
             ex = llm.extract(system, user)
         except LLMError as e:
@@ -159,11 +159,18 @@ class Agent:
         return plan.fallback
 
     @staticmethod
-    def _guard_name(s: Session) -> str:
-        return "grounding" if s.verified else "disclosure_filter"
+    def _nothing_disclosable(s: Session) -> bool:
+        """No claim may be disclosed yet: not verified, or a representative without approved consent."""
+        if not s.verified:
+            return True
+        return s.caller_role == "representative" and s.consent_status != "approved"
+
+    @classmethod
+    def _guard_name(cls, s: Session) -> str:
+        return "disclosure_filter" if cls._nothing_disclosable(s) else "grounding"
 
     def check(self, s: Session, plan: Plan, reply: str, message: str) -> list[str]:
-        if not s.verified:
+        if self._nothing_disclosable(s):
             problems = disclosure_filter(reply, self.sensitive, s.identity.get("id_last4"))
         else:
             problems = grounding_check(reply, plan.data)
