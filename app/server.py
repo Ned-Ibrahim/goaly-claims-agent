@@ -248,7 +248,7 @@ def config():
         "fake_llm": provider == "fake",
         "provider": provider,
         **(model_names(provider) if provider != "fake" else {}),
-        "effort": os.environ.get("CLAIMS_EFFORT", "").strip() or DEFAULT_EFFORT,
+        "effort": (os.environ.get("CLAIMS_EFFORT", "").strip() or DEFAULT_EFFORT) if provider == "anthropic" else None,
         "today": store.today.isoformat(),
         "tts": "kokoro" if tts.available() else "browser",
     }
