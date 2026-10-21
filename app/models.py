@@ -192,3 +192,16 @@ class Session:
     case: CaseRecord = field(default_factory=CaseRecord)
     handoff_packet: dict[str, Any] | None = None
     turn_events: list[dict[str, Any]] = field(default_factory=list)
+    # Representative and consent (step 8).
+    caller_role: Literal["policyholder", "representative"] = "policyholder"
+    rep_name: str | None = None
+    rep_relationship: str | None = None
+    consent_claim_id: str | None = None
+    consent_status: str | None = None  # None, "pending", "approved", "timeout"
+    consent_checks: int = 0
+    # Read-back of voice-captured identity details (7a): fields waiting for the caller's yes.
+    readback_fields: list[str] = field(default_factory=list)
+    # Emotion readings per caller message (11a); see emotion.py.
+    emotion_log: list[dict[str, Any]] = field(default_factory=list)
+    # Index into transcript where the current person's conversation starts (9b switch).
+    window_start: int = 0

@@ -74,6 +74,9 @@ class Plan:
     static_reply: str | None = None  # set when no LLM call is needed
     closing: bool = False  # the call ends after this reply
     fallback_text: str | None = None  # safe reply specific to this turn
+    # A code-written reply that holds identity values (the read-back, 7a) is stored in the
+    # transcript in this masked form, so no later model call ever sees the values.
+    transcript_text: str | None = None
 
     def say(self, line: str) -> None:
         self.instructions.append(line)
