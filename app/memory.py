@@ -97,8 +97,9 @@ def write(session: Session, ex: Extraction, utterance: str) -> list[str]:
     if ex.claim_id:
         written.append(_put(session, "claim_id_hint", ex.claim_id.strip().upper(), quote))
     if ex.email_address_for_summary:
+        # Masked form only: the raw address is never stored (V2 sends to the address on file).
         written.append(
-            _put(session, "email_address", ex.email_address_for_summary.strip().lower(), quote)
+            _put(session, "email_address", mask("email", ex.email_address_for_summary.strip().lower()), quote)
         )
     if ex.question and session.phase.value == "VERIFY_ID" and (
         ex.intent != "none" or ex.claim_id or ex.claim_type or ex.claim_status_hint

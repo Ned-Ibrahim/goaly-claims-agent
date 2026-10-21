@@ -199,3 +199,127 @@ def test_channel_is_set():
     agent, llm = Agent(DataStore(), []), FakeLLM()
     s, _ = run(agent, llm, "hello", channel="voice")
     assert s.channel == "voice"
+
+
+# ---- security audit repros (spoken dates, tens digits, email spellings, partial fragments) -------------
+
+
+def _gone(text, *raws):
+    r = pii.parse_identity(text)
+    for raw in raws:
+        assert raw not in r.masked.lower(), (text, r.masked)
+    return r
+
+
+@pytest.mark.parametrize("text,leaks", [
+    ("I was born in nineteen eighty five on March fifteenth", ["nineteen", "eighty", "march", "fifteenth"]),
+    ("born march 15 85", ["march", "15", "85"]),
+    ("March fifteenth, eighty-five", ["march", "fifteenth", "eighty"]),
+    ("oh three fifteen eighty five", ["fifteen", "eighty", "three"]),
+    ("nineteen eighty five oh three fifteen", ["nineteen", "eighty", "503", "fifteen"]),
+    ("one nine eight five dash zero three dash one five", ["1985", "eight", "dash"]),
+    ("my dob is 15 03 1985", ["1985", "15 03", "03"]),
+])
+def test_audit_spoken_dates_are_a_dob(text, leaks):
+    r = _gone(text, *leaks)
+    assert r.values["dob"] == "1985-03-15"
+    assert "[DOB given]" in r.masked
+    assert "id_last4" not in r.values
+
+
+def test_audit_fail_closed_after_birth_cue():
+    r = _gone("born in March 1985", "1985", "march")
+    assert "dob" not in r.values  # no full date, but the fragment is gone
+    assert _gone("my birthday is March 3rd", "march", "3rd")
+    assert _gone("date of birth: thirty first of december nineteen ninety", "december", "ninety", "thirty")
+    assert _gone("DOB is somewhere around 1985", "1985")
+
+
+def test_audit_birth_cue_does_not_eat_claim_dates():
+    r = pii.parse_identity("born in March 1985 and my claim is from January 2025")
+    assert "January 2025" in r.masked and "1985" not in r.masked
+    assert pii.parse_identity("claim from January 2025").masked == "claim from January 2025"
+    assert pii.parse_identity("I called on March 15 about CL-2048, $1500").masked == (
+        "I called on March 15 about CL-2048, $1500"
+    )
+
+
+@pytest.mark.parametrize("text", ["social is forty four seventy two", "last four forty-four seventy-two",
+                                  "my SSN ends in forty four seventy two"])
+def test_audit_tens_style_id(text):
+    r = pii.parse_identity(text)
+    assert r.values["id_last4"] == "4472"
+    assert "forty" not in r.masked and "seventy" not in r.masked and "4472" not in r.masked
+
+
+def test_audit_tens_style_phone():
+    r = pii.parse_identity("my phone is six five oh five twenty one eighty three thirty six")
+    assert r.values["phone"] == "6505218336"
+    assert "fifty" not in r.masked and "eighty" not in r.masked
+
+
+@pytest.mark.parametrize("text", [
+    "margaret at email.com", "margaret @ email dot com", "margaret at email dot c o m",
+    "my email is margaret at email dot c o m please", "margaret.chen at email dot com",
+])
+def test_audit_email_spellings(text):
+    r = pii.parse_identity(text)
+    assert r.values["email"].startswith("margaret") and r.values["email"].endswith("@email.com")
+    low = r.masked.lower()
+    assert "margaret" not in low and "email.com" not in low and " dot " not in low and "c o m" not in low
+
+
+@pytest.mark.parametrize("text", [
+    "m a r g a r e t at email dot com", "m a r g a r e t c h e n at email dot com",
+    "my email is m a r g a r e t at email dot c o m",
+])
+def test_audit_letter_by_letter_local_part(text):
+    r = pii.parse_identity(text)
+    assert r.values["email"] in ("margaret@email.com", "margaretchen@email.com")
+    assert r.masked in ("[email given]", "my email is [email given]")
+
+
+def test_audit_email_fail_closed():
+    r = pii.parse_identity("my email is margaret at gmail")
+    assert "margaret" not in r.masked and "gmail" not in r.masked
+    assert pii.parse_identity("email me at 5pm please").masked == "email me at 5pm please"
+    assert pii.parse_identity("can you email me a summary").masked == "can you email me a summary"
+
+
+def test_audit_phone_fragments():
+    for text in ("phone is 521-2836", "call me on 521.2836", "my number is 521 2836"):
+        r = pii.parse_identity(text)
+        assert "521" not in r.masked and "2836" not in r.masked and "[number]" not in r.masked, text
+        assert "[phone given]" in r.masked
+    assert pii.parse_identity("claim CL-2048, POL-9921").masked == "claim CL-2048, POL-9921"
+
+
+def test_audit_dob_not_taken_as_id():
+    r = pii.parse_identity("one nine eight five dash zero three dash one five")
+    assert "id_last4" not in r.values
+    r = pii.parse_identity("my SSN last four is 4402 and I was born 1985-03-15")
+    assert r.values == {"id_last4": "4402", "dob": "1985-03-15"}
+
+
+def test_audit_summary_email_never_stored_raw():
+    from app import memory
+
+    given = "other.person@example.com"
+    agent, llm = Agent(DataStore(), []), Recording()
+    s, r = run(agent, llm, MSG, "yes", "that's all", f"yes, send it to {given}")
+    blob = json.dumps(r) + json.dumps(memory.snapshot(s)) + json.dumps(s.handoff_packet or {})
+    assert given not in blob and "other.person" not in blob
+    assert given not in "\n".join(llm.prompts)
+    assert "email_address" not in (s.handoff_packet or {}).get("memory", {})
+    slot = s.memory.get("email_address")
+    assert slot is None or "other.person" not in json.dumps(slot.as_dict())
+
+
+def test_audit_handoff_packet_filters_email_slot():
+    from app import memory
+    from app.models import Extraction
+
+    s = Session("p")
+    memory.write(s, Extraction(email_address_for_summary="Someone@Example.com"), "send it to [email given]")
+    assert s.memory["email_address"].value == "s***@example.com"
+    assert "someone" not in json.dumps(memory.snapshot(s)).lower().replace("s***", "")

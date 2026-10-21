@@ -42,7 +42,7 @@ class Agent:
         summary_email = None
         if s.phase == Phase.POST_PROCESS and parsed.values.get("email"):
             summary_email = parsed.values.pop("email")  # an address for the summary, not identity
-        vals = self._identity_values(s, parsed.values)
+        vals = self._identity_values(s, {**parsed.values, **({"email": summary_email} if summary_email else {})})
 
         if s.phase in (Phase.HANDOFF, Phase.ENDED):
             plan = self.controller.step(s, Extraction())
@@ -225,6 +225,8 @@ def state(s: Session) -> dict[str, Any]:
         "pending": s.pending,
         "proposed_claim_id": s.proposed_claim_id,
         "selected_claim_id": s.selected_claim_id,
+        "caller_role": s.caller_role,
+        "consent_status": s.consent_status,
         "path": s.path,
         "handoff_packet": s.handoff_packet,
         "transcript": [{"role": t["role"], "content": t["content"]} for t in s.transcript],
