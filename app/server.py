@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Literal
 
 import anthropic
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -222,6 +223,69 @@ def get_state(session_id: str):
 @app.get("/api/outbox")
 def get_outbox(session_id: str):
     return [e for e in outbox if e["session_id"] == session_id]
+
+
+REALTIME_INSTRUCTIONS = (
+    "You are the voice of a claims support line. For EVERY caller utterance, call agent_turn with exactly what "
+    "the caller said, then speak the returned \"say\" text word for word, nothing added, nothing removed. "
+    "Never answer from your own knowledge. If the caller interrupts, stop and wait for the next utterance. "
+    "Say nothing before calling the tool except at most one short filler like \"One moment.\""
+)
+REALTIME_TOOL = {
+    "type": "function",
+    "name": "agent_turn",
+    "description": "Send what the caller just said to the claims system and get the exact reply to speak.",
+    "parameters": {
+        "type": "object",
+        "properties": {"caller_said": {"type": "string", "description": "The caller's words, verbatim."}},
+        "required": ["caller_said"],
+    },
+}
+
+
+@app.post("/api/realtime/session")
+def realtime_session(x_api_key: str | None = Header(default=None)):
+    """Mint an ephemeral OpenAI Realtime key. The browser speaks to OpenAI; every reply still comes from /api/chat."""
+    key = (x_api_key or "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise HTTPException(
+            401,
+            "No OpenAI API key. Paste one into the UI, send it as the X-API-Key header, or set OPENAI_API_KEY before starting the server.",
+        )
+    model = os.environ.get("CLAIMS_REALTIME_MODEL", "").strip() or "gpt-realtime"
+    payload = {
+        "session": {
+            "type": "realtime",
+            "model": model,
+            "instructions": REALTIME_INSTRUCTIONS,
+            "audio": {
+                "input": {"turn_detection": {"type": "semantic_vad"}},
+                "output": {"voice": "marin"},
+            },
+            "tools": [REALTIME_TOOL],
+            "tool_choice": "auto",
+        }
+    }
+    try:
+        r = httpx.post(
+            "https://api.openai.com/v1/realtime/client_secrets",
+            headers={"Authorization": f"Bearer {key}"},
+            json=payload,
+            timeout=15,
+        )
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Model provider error ({type(e).__name__}). Please retry.")
+    if r.status_code in (401, 403):
+        raise HTTPException(401, "The API key was rejected by the model provider.")
+    if r.status_code == 429:
+        raise HTTPException(429, "The model provider is rate limiting requests. Try again shortly.")
+    if r.status_code >= 400:
+        raise HTTPException(502, f"Model provider error (HTTP {r.status_code}). Please retry.")
+    try:
+        value = r.json()["value"]
+    except Exception:
+        raise HTTPException(502, "Model provider error (unexpected response). Please retry.")
+    return {"client_secret": value, "model": model}
 
 
 @app.post("/api/tts")

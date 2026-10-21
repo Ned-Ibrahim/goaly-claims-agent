@@ -223,6 +223,7 @@ async function send(text, channel = "text") {
     render(data);
     Voice.speak(data.reply, bubble, data.ended);
     await refreshOutbox();
+    return data;
   } catch (err) {
     typing.remove();
     showError("Could not reach the server. Is it running?");
@@ -324,6 +325,7 @@ async function reset() {
     body: JSON.stringify({ session_id: sessionId }),
   }).catch(() => {});
   Voice.reset();
+  Realtime.stop();
   sessionId = newId();
   lastPhase = "VERIFY_ID";
   showWelcome();
@@ -418,7 +420,10 @@ const Voice = {
   note(msg) { $("voiceNote").textContent = msg || ""; },
 
   async init() {
-    $("mic").addEventListener("click", () => (this.on ? this.stop() : this.start()));
+    $("mic").addEventListener("click", () => {
+      if (!this.on) Realtime.stop(); // the two voice modes never run together
+      return this.on ? this.stop() : this.start();
+    });
     $("skip").addEventListener("click", () => this.cancelSpeech(false));
     $("installSpeech").addEventListener("click", () => this.install());
     $("pauseMic").addEventListener("change", () => this.applyMute());
@@ -973,4 +978,122 @@ document.querySelectorAll(".chip").forEach((c) => c.addEventListener("click", ()
 showWelcome();
 renderCounters({});
 loadConfig();
+/* ---- realtime voice: OpenAI listens and speaks, our /api/chat is still the brain ---- */
+const Realtime = {
+  on: false, pc: null, dc: null, stream: null, audio: null, seen: new Set(), endTimer: null, ending: false,
+
+  init() {
+    $("rt").addEventListener("click", () => (this.on ? this.stop() : this.start()));
+  },
+
+  note(msg) { $("voiceNote").textContent = msg || ""; },
+
+  async start() {
+    if (this.on) return;
+    if (Voice.on) Voice.stop();
+    this.on = true;
+    this.ending = false;
+    $("rt").classList.add("on");
+    $("rt").setAttribute("aria-pressed", "true");
+    $("rtLabel").textContent = "Realtime on";
+    showError("");
+    this.note("Connecting realtime voice...");
+    try {
+      const headers = {};
+      const key = $("apiKey").value.trim();
+      if (key) headers["x-api-key"] = key;
+      const sres = await fetch("/api/realtime/session", { method: "POST", headers });
+      const sdata = await sres.json().catch(() => ({}));
+      if (!sres.ok) throw new Error(sdata.detail || `Realtime session failed (${sres.status}).`);
+      if (!this.on) return;
+      const pc = new RTCPeerConnection();
+      this.pc = pc;
+      this.audio = document.createElement("audio");
+      this.audio.autoplay = true;
+      pc.ontrack = (e) => { this.audio.srcObject = e.streams[0]; };
+      pc.onconnectionstatechange = () => {
+        if (this.on && ["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+          showError("The realtime connection dropped.");
+          this.stop();
+        }
+      };
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      if (!this.on) { this.stop(); return; }
+      pc.addTrack(this.stream.getTracks()[0], this.stream);
+      const dc = pc.createDataChannel("oai-events");
+      this.dc = dc;
+      dc.addEventListener("message", (e) => this.onEvent(e));
+      dc.addEventListener("open", () => this.note("Realtime voice is on. Speak when ready."));
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const cres = await fetch("https://api.openai.com/v1/realtime/calls", {
+        method: "POST",
+        body: offer.sdp,
+        headers: { Authorization: `Bearer ${sdata.client_secret}`, "Content-Type": "application/sdp" },
+      });
+      if (!cres.ok) throw new Error(`Could not start the realtime call (${cres.status}).`);
+      await pc.setRemoteDescription({ type: "answer", sdp: await cres.text() });
+    } catch (err) {
+      if (this.on) showError(err && err.name === "NotAllowedError" ? "Microphone access was not granted; please type." : (err.message || "Realtime voice failed."));
+      this.stop();
+    }
+  },
+
+  stop() {
+    const wasOn = this.on;
+    this.on = false;
+    clearTimeout(this.endTimer); this.endTimer = null;
+    try { this.dc?.close(); } catch { /* ignore */ }
+    try { this.pc?.getSenders().forEach((s) => s.track && s.track.stop()); } catch { /* ignore */ }
+    try { this.pc?.close(); } catch { /* ignore */ }
+    this.stream?.getTracks().forEach((t) => t.stop());
+    if (this.audio) this.audio.srcObject = null;
+    this.pc = null; this.dc = null; this.stream = null; this.audio = null;
+    this.seen.clear();
+    $("rt").classList.remove("on");
+    $("rt").setAttribute("aria-pressed", "false");
+    $("rtLabel").textContent = "Realtime voice";
+    if (wasOn) this.note("");
+  },
+
+  sendEvent(obj) {
+    if (this.dc && this.dc.readyState === "open") this.dc.send(JSON.stringify(obj));
+  },
+
+  onEvent(e) {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch { return; }
+    if (ev.type === "response.done") {
+      for (const item of (ev.response && ev.response.output) || []) {
+        if (item.type === "function_call" && item.name === "agent_turn" && !this.seen.has(item.call_id)) {
+          this.seen.add(item.call_id);
+          this.turn(item);
+        }
+      }
+    } else if (ev.type === "output_audio_buffer.stopped" && this.ending) {
+      setTimeout(() => this.stop(), 400); // the farewell has been spoken
+    } else if (ev.type === "error" && ev.error) {
+      showError(ev.error.message || "Realtime error.");
+    }
+  },
+
+  async turn(item) {
+    let said = "";
+    try { said = String(JSON.parse(item.arguments || "{}").caller_said || "").trim(); } catch { /* handled below */ }
+    let data = null;
+    if (said) data = await send(said, "voice");
+    const say = data ? data.reply : "Sorry, I did not get that. Could you say it again?";
+    this.sendEvent({
+      type: "conversation.item.create",
+      item: { type: "function_call_output", call_id: item.call_id, output: JSON.stringify({ say }) },
+    });
+    this.sendEvent({ type: "response.create" });
+    if (data && data.ended) {
+      this.ending = true;
+      this.endTimer = setTimeout(() => this.stop(), 6000 + Math.min(say.length * 60, 20000));
+    }
+  },
+};
+
 Voice.init();
+Realtime.init();
