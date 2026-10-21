@@ -109,8 +109,8 @@ function renderCounters(c) {
   box.replaceChildren();
   const items = [
     ["verify_failures", "failed verifications", "handoff at 3"],
-    ["off_topic", "off-topic questions", "offer at 3, handoff at 5"],
-    ["refusals", "ID refusals", "offer at 3"],
+    ["off_topic", "off-topic questions", "offer at 2, handoff at 3"],
+    ["resistance", "resisted steps", "explain at 1, offer at 2, handoff at 3"],
   ];
   for (const [k, label, rule] of items) {
     const d = el("div", "counter");

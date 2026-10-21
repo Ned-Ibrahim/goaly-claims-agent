@@ -1,0 +1,11 @@
+services:
+  claims-agent:
+    build: .
+    ports:
+      - "8000:8000"
+    # .env is optional. Without it the app starts and asks for a key in the web page.
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./traces:/srv/traces
