@@ -49,7 +49,7 @@ Typing always works.
 Voice needs Chrome with on-device speech recognition.
 On first use the page offers to install the on-device language pack (the "Install on-device speech" button).
 If on-device recognition is not available, voice stays off and the page says why.
-Replies are spoken only with a local system voice, so neither the caller's audio nor the reply text leaves the machine.
+Recognition runs on the device and replies are spoken with a local system voice, so neither the caller's audio nor the spoken reply goes to a speech service.
 Microphone access works on `localhost` without HTTPS.
 
 ## How one caller turn flows
@@ -98,7 +98,7 @@ The second off-topic message in a call offers a human, and the third hands off.
 
 The caller says: "I'm the policyholder. My name is Margaret Chen, policy POL-9921. I'm calling about my denied healthcare claim from January. DOB is 1985-03-15, SSN last four is 4472."
 
-1. The PII parser stores the name, date of birth and ID last four, and the model sees only Placeholders.
+1. The PII parser stores the date of birth and ID last four, and the model sees Placeholders in their place. The name goes to the model, which reads it for the check.
 2. The extract call records the hint (healthcare, denied, January) as Slots while the call is still in VERIFY_ID.
 3. Code checks the identity: 3 or more details match record P9 and none conflict. The call moves to RESOLVE_INTENT.
 4. The stored hint singles out CL-2048 (Margaret also has a closed January healthcare claim, CL-2011, which the word "denied" rules out). The agent proposes CL-2048 instead of asking "which claim?" from scratch.
@@ -124,14 +124,14 @@ No amount of frustration lowers the gate: claim details stay hidden until verifi
 
 What never reaches the model:
 
-- Identity details. Code parses them out of the caller's message first, so the model sees Placeholders, and verification takes no values from the model (ADR 0003).
+- Identity details other than the name. Code parses them out of the caller's message first, so the model sees Placeholders, and verification takes no values from the model (ADR 0003).
 - Claim data before verification.
 - Claim fields the current answer does not need. Only the selected claim's needed fields are sent.
 
 Other controls:
 
 - Speech recognition and speech output run on the device, so audio and spoken text do not go to a speech vendor.
-- An exact-match check runs on every prompt, reply and API response for stored identity values and the matched record's name and aliases.
+- An exact-match check runs on every prompt, reply and API response for the stored date of birth, phone, email and ID last four.
 - Memory, traces and API responses carry masked values.
 
 What production would need:
@@ -151,10 +151,17 @@ SOP_LLM=fake uv run uvicorn app.server:app --port 8000 &
 python3 evals/run_evals.py --mode fake             # scenarios against the running fake-mode server
 ```
 
-The evals so far have been run in fake mode only.
-The agent has not been run against a live model yet, so no live results are claimed here.
+In fake mode all 46 scenarios pass, and so does the consent timeout scenario (start the server with `CLAIMS_CONSENT_SCENARIO=timeout` and add `--consent-scenario timeout`).
+Nothing has run against a live model yet, so no live results are claimed here.
 With a key, `python3 evals/run_evals.py --simulate --k 5` plays a model-written caller five times per scenario and scores pass^5.
 See `evals/README.md` for the options.
+
+## Known limits
+
+- The agent has not run against a live model yet. Every result above comes from the deterministic stand-in.
+- Voice mode has not been tested with a real microphone. Echo cancellation during an Interruption is the part most likely to need the "Pause mic while agent speaks" fallback.
+- Presidio is optional and stays off unless installed with the `presidio` extra. Without it, the parser's own patterns and the fail-closed sweep do the work.
+- When a Representative describes a claim instead of giving its number, a hint that matches one claim starts a Consent request, while a hint that matches none gets "which claim number?". That difference tells the caller whether a matching claim exists.
 
 ## Configuration
 
