@@ -56,10 +56,10 @@ def test_anthropic_extract_uses_extract_model_without_effort():
     a.client = MagicMock()
     ex = Extraction()
     a.client.beta.messages.parse.return_value = NS(stop_reason="end_turn", parsed_output=ex)
-    assert a.extract("sys", "user") is ex
+    assert a.extract("sys", "user") == ex
     kw = a.client.beta.messages.parse.call_args.kwargs
     assert kw["model"] == "claude-haiku-5-5"
-    assert kw["output_format"] is Extraction
+    assert kw["output_format"] is L.ExtractionWire
     assert "output_config" not in kw
 
 
@@ -134,9 +134,9 @@ def test_openai_extract_uses_parse():
     ex = Extraction()
     o.client.chat.completions.parse.return_value = NS(
         choices=[NS(message=NS(parsed=ex, refusal=None))])
-    assert o.extract("sys", "user") is ex
+    assert o.extract("sys", "user") == ex
     kw = o.client.chat.completions.parse.call_args.kwargs
-    assert kw["model"] == "e" and kw["response_format"] is Extraction
+    assert kw["model"] == "e" and kw["response_format"] is L.ExtractionWire
     assert kw["messages"][0] == {"role": "system", "content": "sys"}
 
 
@@ -207,3 +207,24 @@ def test_config_reports_models_never_key(monkeypatch):
     assert c["provider"] == "anthropic" and c["extract_model"] == "claude-haiku-5-5"
     assert c["respond_model"] == "claude-opus-5-5" and c["server_has_key"] is True
     assert "secret-key" not in str(c)
+
+
+def test_wire_schema_has_no_optional_parameters():
+    # The API rejects a structured-output schema with more than 24 optional parameters.
+    schema = L.ExtractionWire.model_json_schema()
+
+    def optional(s):
+        n = 0
+        for node in [s, *s.get("$defs", {}).values()]:
+            props = node.get("properties", {})
+            n += len(set(props) - set(node.get("required", [])))
+        return n
+
+    assert optional(schema) == 0
+    assert set(L.ExtractionWire.model_fields) == set(Extraction.model_fields)
+
+
+def test_wire_reply_converts_to_extraction():
+    wire = L.ExtractionWire.model_validate(Extraction(intent="claim_status").model_dump())
+    ex = L._to_extraction(wire)
+    assert isinstance(ex, Extraction) and ex.intent == "claim_status"

@@ -9,11 +9,13 @@ templated replies) for tests and for running the eval suite without an API key.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Protocol
 
 import anthropic
 import openai
+from pydantic import BaseModel, Field, create_model
 
 from .models import Extraction
 
@@ -45,8 +47,37 @@ class LLM(Protocol):
     def respond(self, system: str, transcript: list[dict[str, str]]) -> str: ...
 
 
+log = logging.getLogger("claims.llm")
+
+
+def _all_required(model: type[BaseModel]) -> type[BaseModel]:
+    """The same fields with no defaults, nested models included.
+
+    Structured outputs cap a schema at 24 optional parameters; Extraction has more, all
+    with defaults so code can build an empty one. The wire copy makes every field required
+    (nullable ones stay nullable), and replies are converted back to the real model.
+    """
+    fields = {}
+    for name, f in model.model_fields.items():
+        ann = f.annotation
+        if isinstance(ann, type) and issubclass(ann, BaseModel):
+            ann = _all_required(ann)
+        fields[name] = (ann, Field(..., description=f.description))
+    return create_model(f"{model.__name__}Wire", __doc__=model.__doc__, **fields)
+
+
+ExtractionWire = _all_required(Extraction)
+
+
+def _to_extraction(wire: BaseModel) -> Extraction:
+    return Extraction.model_validate(wire.model_dump())
+
+
 def provider_error(e: Exception) -> ProviderError:
     """Map an Anthropic or OpenAI SDK error onto ProviderError."""
+    # The provider's own status and message (never the key) make a 502 diagnosable.
+    log.warning("model provider error: %s status=%s %s", type(e).__name__,
+                getattr(e, "status_code", None), getattr(e, "message", "") or str(e)[:300])
     if isinstance(e, (anthropic.AuthenticationError, openai.AuthenticationError)):
         return ProviderError(401, type(e).__name__)
     if isinstance(e, (anthropic.RateLimitError, openai.RateLimitError)):
@@ -83,7 +114,7 @@ class AnthropicLLM:
             raise LLMError(f"unreadable extraction ({type(e).__name__})") from e
         if resp.stop_reason == "refusal" or resp.parsed_output is None:
             raise LLMError(f"extraction stopped: {resp.stop_reason}")
-        return resp.parsed_output
+        return _to_extraction(resp.parsed_output)
 
     def _parse(self, system: str, user: str):
         # No effort here: Haiku 5.5 defaults to medium, and omitting it is identical.
@@ -92,7 +123,7 @@ class AnthropicLLM:
             max_tokens=4000,
             system=system,
             messages=[{"role": "user", "content": user}],
-            output_format=Extraction,
+            output_format=ExtractionWire,
             betas=[FALLBACK_BETA],
             fallbacks="default",
         )
@@ -143,7 +174,7 @@ class OpenAILLM:
             resp = self.client.chat.completions.parse(
                 model=self.extract_model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                response_format=Extraction,
+                response_format=ExtractionWire,
             )
         except openai.APIError as e:
             raise provider_error(e) from e
@@ -152,7 +183,7 @@ class OpenAILLM:
         msg = resp.choices[0].message
         if msg.refusal or msg.parsed is None:
             raise LLMError("extraction stopped: refusal" if msg.refusal else "extraction empty")
-        return msg.parsed
+        return _to_extraction(msg.parsed)
 
     def respond(self, system: str, transcript: list[dict[str, str]]) -> str:
         try:
