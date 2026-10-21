@@ -281,3 +281,10 @@ class FakeLLM:
             parts.append("Would you like me to connect you with a human representative?")
         parts.extend(_fake_consent_reply(plan))
         return " ".join(parts) or "How can I help you with your claim today?"
+
+    def respond_stream(self, system: str, transcript: list[dict[str, str]]):
+        """The normal reply in three chunks (cut mid-word on purpose, like real deltas)."""
+        reply = self.respond(system, transcript)
+        step = max(1, -(-len(reply) // 3))
+        for i in range(0, len(reply), step):
+            yield reply[i : i + step]

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterator
 from typing import Protocol
 
 import anthropic
@@ -46,6 +47,7 @@ class ProviderError(Exception):
 class LLM(Protocol):
     def extract(self, system: str, user: str) -> Extraction: ...
     def respond(self, system: str, transcript: list[dict[str, str]]) -> str: ...
+    def respond_stream(self, system: str, transcript: list[dict[str, str]]) -> Iterator[str]: ...
 
 
 log = logging.getLogger("claims.llm")
@@ -154,6 +156,33 @@ class AnthropicLLM:
             raise LLMError(f"empty reply (stop_reason={resp.stop_reason})")
         return text
 
+    def respond_stream(self, system: str, transcript: list[dict[str, str]]) -> Iterator[str]:
+        """The same call as respond(), yielding text deltas. Errors map the same way."""
+        got = False
+        try:
+            with self.client.beta.messages.stream(
+                model=self.respond_model,
+                max_tokens=4000,
+                system=system,
+                messages=[{"role": t["role"], "content": t["content"]} for t in transcript],
+                output_config={"effort": self.effort},
+                betas=[FALLBACK_BETA],
+                fallbacks="default",
+            ) as stream:
+                for delta in stream.text_stream:
+                    got = got or bool(delta.strip())
+                    yield delta
+                final = stream.get_final_message()
+        except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
+            pe = provider_error(e)
+            if pe.status != 502:
+                raise pe from e
+            raise LLMError(type(e).__name__) from e
+        if final.stop_reason == "refusal":
+            raise LLMError("reply declined by the model")
+        if not got:
+            raise LLMError(f"empty reply (stop_reason={final.stop_reason})")
+
 
 class OpenAILLM:
     """Native OpenAI SDK. Model names are required settings; no defaults are guessed."""
@@ -205,6 +234,36 @@ class OpenAILLM:
         if not text:
             raise LLMError(f"empty reply (finish_reason={resp.choices[0].finish_reason})")
         return text
+
+    def respond_stream(self, system: str, transcript: list[dict[str, str]]) -> Iterator[str]:
+        got = False
+        refused = False
+        try:
+            stream = self.client.chat.completions.create(
+                model=self.respond_model,
+                messages=[{"role": "system", "content": system}]
+                + [{"role": t["role"], "content": t["content"]} for t in transcript],
+                stream=True,
+            )
+            with stream:
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    d = chunk.choices[0].delta
+                    if getattr(d, "refusal", None):
+                        refused = True
+                    if d.content:
+                        got = got or bool(d.content.strip())
+                        yield d.content
+        except (openai.APIStatusError, openai.APIConnectionError) as e:
+            pe = provider_error(e)
+            if pe.status != 502:
+                raise pe from e
+            raise LLMError(type(e).__name__) from e
+        if refused:
+            raise LLMError("reply declined by the model")
+        if not got:
+            raise LLMError("empty reply")
 
 
 # The deterministic stand-in lives in fake_llm.py; re-exported for existing imports.
