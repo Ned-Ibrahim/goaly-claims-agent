@@ -8,6 +8,7 @@ Set SOP_LLM=fake to run with the deterministic FakeLLM (no key needed).
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import threading
@@ -18,7 +19,7 @@ from typing import Literal
 import anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -130,6 +131,78 @@ def chat(body: ChatIn, x_api_key: str | None = Header(default=None)):
             sessions[body.session_id] = before
             log.exception("turn failed; session restored")
             raise HTTPException(500, "Something went wrong on our side. The message was not applied; please resend.")
+
+
+def _http_error(e: Exception) -> HTTPException | None:
+    """The HTTP error /api/chat gives for a provider failure, or None for anything else."""
+    if isinstance(e, anthropic.APIError):
+        status = 401 if isinstance(e, anthropic.AuthenticationError) else 429 if isinstance(e, anthropic.RateLimitError) else 502
+    elif isinstance(e, _ProviderError):
+        status = getattr(e, "status", 502)
+    else:
+        return None
+    if status == 401:
+        return HTTPException(401, "The API key was rejected by the model provider.")
+    if status == 429:
+        return HTTPException(429, "The model provider is rate limiting requests. Try again shortly.")
+    return HTTPException(502, f"Model provider error ({type(e).__name__}). Please resend.")
+
+
+def _line(event: dict) -> str:
+    return json.dumps(event, ensure_ascii=False) + "\n"
+
+
+@app.post("/api/chat/stream")
+def chat_stream(body: ChatIn, x_api_key: str | None = Header(default=None)):
+    """Same turn as /api/chat, sent as NDJSON: one {"type":"sentence"} line per sentence as it
+    passes the gates, then {"type":"done", ...the /api/chat fields}. The session lock is held until
+    the stream ends. Failures before the first sentence are the same HTTP errors as /api/chat;
+    after that they are a final {"type":"error"} line."""
+    llm = _llm(x_api_key)
+    s, lock = _session(body.session_id)
+    lock.acquire()
+    before = copy.deepcopy(s)
+
+    def events():
+        started = False
+        turn = agent.handle_stream(s, body.message.strip(), llm, channel=body.channel, heard=body.heard)
+        try:
+            for kind, payload in turn:
+                started = True
+                yield {"type": "sentence", "text": payload} if kind == "sentence" else {"type": "done", **payload}
+        except GeneratorExit:
+            raise
+        except Exception as e:
+            sessions[body.session_id] = before  # a failed turn leaves no trace
+            http = _http_error(e)
+            if not http:
+                log.exception("streamed turn failed; session restored")
+            if not started:
+                raise http or HTTPException(500, "Something went wrong on our side. The message was not applied; please resend.")
+            yield {"type": "error", "detail": http.detail if http else "Something went wrong on our side. The message was not applied; please resend."}
+        finally:
+            turn.close()  # records what was emitted if the caller went away
+            lock.release()
+
+    gen = events()
+    try:
+        first = next(gen)  # runs the turn up to its first sentence, so early failures are HTTP errors
+    except StopIteration:
+        first = None
+    except BaseException:
+        gen.close()
+        raise
+
+    def body_iter():
+        try:
+            if first is not None:
+                yield _line(first)
+            for ev in gen:
+                yield _line(ev)
+        finally:
+            gen.close()
+
+    return StreamingResponse(body_iter(), media_type="application/x-ndjson")
 
 
 @app.post("/api/reset")

@@ -9,15 +9,29 @@ turn, both times with no authority: once to read the caller, once to phrase the 
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 from . import memory, pii
 from .guards import disclosure_filter, grounding_check
 from .llm import LLM, LLMError
 from .models import PII_FIELDS, Extraction, Phase, Session
+from .sentences import SentenceSplitter, split_sentences
 from .prompts import extractor_system, extractor_user, responder_system
 from .sop import Plan, SOPController
 from .store import DataStore
+
+
+@dataclass
+class _Turn:
+    """What _begin() hands on: a finished result (done), or the plan and context for the reply."""
+
+    done: dict[str, Any] | None = None
+    plan: Plan | None = None
+    ex: Extraction | None = None
+    masked: str = ""
+    vals: list[str] | None = None
 
 
 class Agent:
@@ -29,6 +43,110 @@ class Agent:
     def handle(
         self, s: Session, message: str, llm: LLM, channel: str | None = None, heard: str | None = None
     ) -> dict[str, Any]:
+        turn = self._begin(s, message, llm, channel, heard)
+        if turn.done is not None:
+            return turn.done
+        reply = self.respond(s, turn.plan, llm, turn.masked, turn.vals)
+        return self._finish(s, turn, reply)
+
+    def handle_stream(
+        self, s: Session, message: str, llm: LLM, channel: str | None = None, heard: str | None = None
+    ) -> Iterator[tuple[str, Any]]:
+        """handle(), but yields ("sentence", text) as each sentence passes the gates, then
+        ("done", result). Nothing is yielded that has not passed.
+
+        Gate classification: every check in self.check (disclosure_filter, grounding_check) and
+        the identity egress check are pattern scans that read any prefix of a reply, so they all
+        run on the text so far plus the candidate sentence before it is emitted. The last
+        sentence is therefore gated against the whole reply; no check needs a separate
+        end-of-reply pass.
+
+        On a gate failure:
+        - before any sentence was emitted: stop the model stream and use the ordinary
+          non-streaming respond() with its retry, then emit that result;
+        - after some were emitted: stop the model stream and emit plan.fallback (the same
+          code-written text handle() uses when the retry fails). Earlier sentences stay said.
+        The transcript stores exactly the emitted text.
+        """
+        turn = self._begin(s, message, llm, channel, heard)
+        if turn.done is not None:
+            if turn.done["reply"]:
+                yield from (("sentence", x) for x in split_sentences(turn.done["reply"]))
+            yield "done", turn.done
+            return
+        plan = turn.plan
+        if plan.static_reply:
+            for x in split_sentences(plan.static_reply):
+                yield "sentence", x
+            yield "done", self._finish(s, turn, plan.static_reply)
+            return
+
+        emitted: list[str] = []
+        finished = False
+        try:
+            for x in self._stream_reply(s, turn, llm, emitted):
+                emitted.append(x)
+                yield "sentence", x
+            finished = True
+        finally:
+            if not finished:  # the caller went away: the transcript keeps what was emitted
+                s.transcript.append({"role": "assistant", "content": " ".join([*emitted, "[interrupted]"])})
+        yield "done", self._finish(s, turn, " ".join(emitted))
+
+    def _stream_reply(self, s: Session, turn: "_Turn", llm: LLM, emitted: list[str]) -> Iterator[str]:
+        plan, vals = turn.plan, turn.vals
+        system, make_msgs = self._responder_inputs(s, plan, vals)
+        splitter = SentenceSplitter()
+        stream = llm.respond_stream(system, make_msgs())
+        problems: list[str] = []
+
+        def gate(sentence: str) -> list[str]:
+            candidate = " ".join([*emitted, sentence])
+            found = self.check(s, plan, candidate, turn.masked)
+            hits = pii.egress_hits(candidate, vals)
+            if hits:
+                self._egress(s, "reply", hits)
+                found = [*found, "identity details"]
+            return found
+
+        def blocked(found: list[str]) -> Iterator[str]:
+            stream.close()  # stops the model stream
+            self.controller.ev(
+                s, "guard", name=self._guard_name(s),
+                action="regenerate" if not emitted else "fallback", found=found, stream=True,
+            )
+            if emitted:
+                yield from split_sentences(plan.fallback)
+            else:
+                yield from split_sentences(self.respond(s, plan, llm, turn.masked, vals))
+
+        try:
+            for delta in stream:
+                for sentence in splitter.feed(delta):
+                    problems = gate(sentence)
+                    if problems:
+                        yield from blocked(problems)
+                        return
+                    yield sentence
+            tail = splitter.flush()
+            if tail:
+                problems = gate(tail)
+                if problems:
+                    yield from blocked(problems)
+                    return
+                yield tail
+        except LLMError as e:
+            stream.close()
+            self.controller.ev(s, "guard", name="responder", action=f"fallback ({e})")
+            yield from split_sentences(plan.fallback)
+            return
+        if not emitted:  # the model produced nothing usable
+            yield from split_sentences(plan.fallback)
+
+    def _begin(
+        self, s: Session, message: str, llm: LLM, channel: str | None, heard: str | None
+    ) -> "_Turn":
+        """Everything before the reply: parse identity, extract, remember, run the SOP step."""
         s.turn += 1
         s.turn_events = []
         if channel:  # None keeps the session's channel (the server always passes one)
@@ -48,7 +166,7 @@ class Agent:
             plan = self.controller.step(s, Extraction())
             s.transcript.append({"role": "user", "content": masked})
             s.transcript.append({"role": "assistant", "content": plan.static_reply})
-            return self.result(s, plan.static_reply, None, vals)
+            return _Turn(done=self.result(s, plan.static_reply, None, vals))
 
         claims = self._claims_for_extract(s)
         system = self._clean(s, extractor_system(claims), vals, "extract_system")
@@ -71,10 +189,12 @@ class Agent:
             self.controller.ev(s, "scope", in_scope=True)
 
         plan = self.controller.step(s, ex)
-        reply = self.respond(s, plan, llm, masked, vals)
-        stored = plan.transcript_text or reply
+        return _Turn(plan=plan, ex=ex, masked=masked, vals=vals)
+
+    def _finish(self, s: Session, turn: "_Turn", reply: str) -> dict[str, Any]:
+        stored = turn.plan.transcript_text or reply
         s.transcript.append({"role": "assistant", "content": stored})
-        return self.result(s, reply, ex, vals, readback=bool(plan.transcript_text))
+        return self.result(s, reply, turn.ex, turn.vals, readback=bool(turn.plan.transcript_text))
 
     def _claims_for_extract(self, s: Session) -> list[dict] | None:
         """Claims the extract model may see. A representative sees none until the policyholder
@@ -130,15 +250,10 @@ class Agent:
         vals = vals if vals is not None else self._identity_values(s, {})
         if plan.static_reply:
             return plan.static_reply
-        system = responder_system(plan.phase, plan.instructions, plan.data, known=memory.known_so_far(s))
-        system = self._clean(s, system, vals, "respond_system")
+        system, make_msgs = self._responder_inputs(s, plan, vals)
         for attempt in range(2):
             try:
-                msgs = [
-                    {**t, "content": self._clean(s, t["content"], vals, "respond_messages")}
-                    for t in memory.recent_turns(s)
-                ]
-                reply = llm.respond(system, msgs)
+                reply = llm.respond(system, make_msgs())
             except LLMError as e:
                 self.controller.ev(s, "guard", name="responder", action=f"fallback ({e})")
                 return plan.fallback
@@ -157,6 +272,19 @@ class Agent:
                 + ". Write the reply again without any of that."
             )
         return plan.fallback
+
+    def _responder_inputs(self, s: Session, plan: Plan, vals: list[str]):
+        """The responder's system prompt and a builder for its (cleaned) messages."""
+        system = responder_system(plan.phase, plan.instructions, plan.data, known=memory.known_so_far(s))
+        system = self._clean(s, system, vals, "respond_system")
+
+        def make_msgs() -> list[dict[str, str]]:
+            return [
+                {**t, "content": self._clean(s, t["content"], vals, "respond_messages")}
+                for t in memory.recent_turns(s)
+            ]
+
+        return system, make_msgs
 
     @staticmethod
     def _nothing_disclosable(s: Session) -> bool:
