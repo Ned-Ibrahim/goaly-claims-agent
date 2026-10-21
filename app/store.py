@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from itertools import permutations
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,14 @@ MONEY_FIELDS = ("expected_reimbursement_amount", "allowed_max_amount", "net_pay"
 def _norm_name(v: str) -> str:
     # Letters only, so "Ya Wen Li", "Yawen Li" and "Ya-Wen Li" compare equal.
     return re.sub(r"[^a-z]", "", v.lower())
+
+
+def _name_forms(v: str) -> set[str]:
+    """Every order of the name's words, joined (7b): "Ma Tian" -> matian, tianma."""
+    words = [w for w in re.split(r"[^a-z]+", v.lower()) if w]
+    if not 0 < len(words) <= 5:
+        return {_norm_name(v)}
+    return {"".join(order) for order in permutations(words)}
 
 
 def _digits(v: str) -> str:
@@ -53,6 +62,11 @@ NORMALIZERS = {
     "email": lambda v: v.strip().strip("<>\"'").rstrip(".,;:!?").lower(),
     "id_last4": lambda v: _digits(v)[-4:],
 }
+
+def _forms(field: str, v: str) -> set[str]:
+    """The comparable forms of one value on file."""
+    return _name_forms(v) if field == "full_name" else {NORMALIZERS[field](v)}
+
 
 # Every value on file that proves a field, aliases included. An alias is the same
 # person (e.g. a speech-to-text spelling of the name), so it counts as a match.
@@ -121,7 +135,7 @@ class DataStore:
         def matched_fields(p: dict) -> list[str]:
             return [
                 k for k, v in pii.items()
-                if v in {NORMALIZERS[k](x) for x in RECORD_VALUES[k](p)}
+                if v in {f for x in RECORD_VALUES[k](p) for f in _forms(k, x)}
             ]
 
         def score(p: dict) -> tuple[int, int]:
@@ -134,6 +148,15 @@ class DataStore:
         mismatched = len(pii) - len(matched)
         verified = len(matched) >= 3 and mismatched == 0
         return VerificationResult(verified, best["party_id"], matched, mismatched)
+
+    # ---- representatives and consent ------------------------------------
+
+    def representatives_for(self, party_id: str) -> list[dict]:
+        """Representatives on file for one policyholder (name and relationship only)."""
+        return [r for r in self.representatives if r["buyer_party_id"] == party_id]
+
+    def consent_scenario(self, name: str) -> dict:
+        return self.consent_scenarios[name]
 
     def customer(self, customer_id: str) -> dict:
         return self.customers[customer_id]

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from .models import Extraction
+from .models import EmotionReading, EmotionReadings, Extraction
 from .store import norm_dob
 
 # ---------------------------------------------------------------------------
@@ -29,6 +29,106 @@ _MONTHS = [
 def _find(pattern: str, text: str, flags: int = re.IGNORECASE) -> str | None:
     m = re.search(pattern, text, flags)
     return m.group(1) if m else None
+
+
+# (emotion, level, pattern). First matching pattern per emotion wins; strong patterns come first.
+_EMOTION_PATTERNS = [
+    ("anger", "strong", r"useless|idiot|stupid|incompetent|damn|\bhell\b|\bshit\b|\bfuck\w*|\bcrap\b|furious|outrageous"),
+    ("anger", "mild", r"unacceptable|angry"),
+    ("frustration", "mild", r"already told you|ridiculous|just tell me|frustrat|annoy|unbelievable|come on"),
+    ("anxiety", "mild", r"worried|scared|anxious|nervous|can't afford|cant afford|deadline"),
+    ("confusion", "mild", r"what do you mean|i don't understand|i dont understand|confus"),
+    ("refusal", "strong", r"not giving you|won't give|wont give|i'm not telling|im not telling|not going to give|i refuse"),
+    ("refusal", "mild", r"why do you need|why do i have to"),
+]
+
+
+def _fake_emotions(text: str) -> EmotionReadings:
+    """Phrase heuristic for the five emotion readings (decision 11a)."""
+    low = text.lower()
+    out: dict[str, EmotionReading] = {}
+    for name, level, pattern in _EMOTION_PATTERNS:
+        if name in out:
+            continue
+        m = re.search(pattern, low)
+        if m:
+            out[name] = EmotionReading(level=level, words=m.group(0))
+    return EmotionReadings(**out)
+
+
+def _fake_switch_choice(low: str) -> str:
+    """The answer to the offer to verify as another claim's owner (6c)."""
+    if re.search(r"\b(human|person|representative)\b", low):
+        return "human"
+    if re.search(r"verify as|as the owner|as them|as him|as her|go back", low):
+        return "verify"
+    return "none"
+
+
+_RELATIONS = (
+    "son|daughter|mother|father|wife|husband|brother|sister|neighbor|friend|nephew|niece|"
+    "grandson|granddaughter|caregiver|attorney|aunt|uncle|cousin"
+)
+# "calling for my mother" names the policyholder's role; the caller's own is the other side.
+_INVERSE_RELATION = {"mother": "child", "father": "child", "wife": "spouse", "husband": "spouse",
+                     "brother": "sibling", "sister": "sibling"}
+
+
+def _fake_representative(msg: str, ex: Extraction) -> None:
+    """Phrase heuristic for a caller acting for someone else (decision 8a).
+
+    "I'm David Chen, calling for my mother Margaret Chen" gives rep_name David Chen,
+    relationship child, and full_name Margaret Chen (the policyholder).
+    """
+    m = re.search(r"calling\s+(?:for|on behalf of)\s+(.*)", msg, re.IGNORECASE | re.DOTALL)
+    if not m:
+        # "I'm David Chen, her son": a later turn that only names the caller.
+        rel = re.search(rf"\b(?:her|his|their)\s+({_RELATIONS})\b", msg, re.IGNORECASE)
+        if rel and ex.full_name:
+            ex.calling_for_other, ex.rep_name, ex.full_name = True, ex.full_name, None
+            ex.relationship = rel.group(1).lower()
+        return
+    ex.calling_for_other = True
+
+    def names(text: str) -> list[str]:
+        return [
+            f"{a} {b}" for a, b in re.findall(r"\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b", text)
+            if not ({a.lower(), b.lower()} & _NOT_NAMES)
+        ]
+
+    holder = names(m.group(1))
+    ex.full_name = holder[0] if holder else None
+    own = [n for n in names(msg) if n not in holder]
+    ex.rep_name = own[0] if own else None
+    direct = re.search(rf"\b(?:her|his|their)\s+({_RELATIONS})\b", msg, re.IGNORECASE)
+    named = re.search(rf"\bmy\s+({_RELATIONS})\b", m.group(1), re.IGNORECASE)
+    if direct:
+        ex.relationship = direct.group(1).lower()
+    elif named:
+        rel = named.group(1).lower()
+        ex.relationship = _INVERSE_RELATION.get(rel, rel)
+
+
+def _fake_consent_reply(plan: str) -> list[str]:
+    """Template lines for the representative and consent instructions (step 8)."""
+    parts = []
+    if "own name and how they are related" in plan:
+        parts.append("Could you also tell me your own name and how you're related to the policyholder?")
+    if "confirmed as someone on file" in plan:
+        parts.append("Thank you, I can help you with that.")
+    if "Ask which claim number" in plan:
+        parts.append("Which claim number would you like to discuss?")
+    if "waiting on the policyholder" in plan:
+        parts.append("I've asked the policyholder to approve this, and I'm waiting on their answer.")
+    if "approval request timed out" in plan:
+        parts.append("The policyholder hasn't answered, so I can't share anything. Would you like me to connect you with a human representative?")
+    if "approval did not come back" in plan:
+        parts.append("I still can't share anything without the policyholder's approval. Would you like me to connect you with a human representative?")
+    if "can only discuss a policy" in plan:
+        parts.append("I can only discuss a policy with the policyholder or someone already on file for them. The person I'm connecting you with can help add you.")
+    if "has approved this for this claim" in plan:
+        parts.append("The policyholder has approved it.")
+    return parts
 
 
 class FakeLLM:
@@ -120,6 +220,9 @@ class FakeLLM:
             ex.emotion = "anxious"
         elif re.search(r"confus|don't understand|what do you mean", low):
             ex.emotion = "confused"
+        ex.emotions = _fake_emotions(msg)
+        _fake_representative(msg, ex)
+        ex.switch_choice = _fake_switch_choice(low)
         if "?" in msg:
             ex.question = msg.strip()[:160]
         return ex
@@ -164,10 +267,15 @@ class FakeLLM:
             parts.append("No problem, I won't send an email. Thanks for calling!")
         if "human representative now" in plan:
             parts.append("I'm connecting you with a human representative now.")
+        if "verify again as the person" in plan:
+            parts.append("I can't help with that claim under your verification. I can verify you as the person it belongs to, or connect you with a human. Which would you prefer?")
+        if "verify them as the person" in plan:
+            parts.append("Okay, let's verify you as that person. Could you share any three of the identity details?")
         if "Ask what they'd like help with" in plan:
             parts.append("How can I help with your claims today?")
         if "anything else" in plan:
             parts.append("Is there anything else I can help with?")
         if "Offer to connect them with a human" in plan or "Ask directly whether" in plan:
             parts.append("Would you like me to connect you with a human representative?")
+        parts.extend(_fake_consent_reply(plan))
         return " ".join(parts) or "How can I help you with your claim today?"

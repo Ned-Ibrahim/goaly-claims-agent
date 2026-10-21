@@ -213,6 +213,23 @@ h1 { margin: 0; font-size: 17px; font-weight: 650; }
 .composer textarea:focus, .key input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .error { margin: 0 12px 12px; padding: 8px 12px; border-radius: 8px; background: var(--bad-bg); color: var(--bad); font-size: 13px; }
 
+/* ---- voice ---- */
+.voicebar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 8px 12px 0; font-size: 13px; }
+.voicebar .btn { padding: 6px 12px; font-size: 13px; }
+.voicebar .opt { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; cursor: pointer; }
+.voice-note { color: var(--muted); font-size: 12px; flex-basis: 100%; }
+.voice-note:empty { display: none; }
+.mic { display: inline-flex; align-items: center; gap: 8px; }
+.mic-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+.mic.on { border-color: var(--bad); color: var(--bad); }
+.mic.on .mic-dot { background: var(--bad); animation: pulse 1.4s ease-in-out infinite; }
+.mic.on.heard .mic-dot { animation: none; transform: scale(1.4); }
+.mic:disabled { cursor: not-allowed; }
+.msg .interrupted { display: block; margin-top: 4px; font: 11px var(--mono); color: var(--warn); }
+.msg.interim { opacity: 0.6; font-style: italic; }
+@keyframes pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .mic.on .mic-dot { animation: none; } }
+
 /* ---- inspector ---- */
 .inspector { display: flex; flex-direction: column; gap: 14px; overflow-y: auto; min-height: 0; padding-bottom: 4px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }

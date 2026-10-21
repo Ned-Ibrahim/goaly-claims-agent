@@ -13,6 +13,7 @@ import os
 import threading
 from collections import OrderedDict
 from pathlib import Path
+from typing import Literal
 
 import anthropic
 from dotenv import load_dotenv
@@ -21,8 +22,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import llm as llm_mod
 from .agent import Agent, state
-from .llm import DEFAULT_MODEL, AnthropicLLM, FakeLLM
+from .llm import AnthropicLLM, ConfigError, FakeLLM, OpenAILLM, model_names
 from .models import Session
 from .store import DataStore
 
@@ -44,6 +46,8 @@ log = logging.getLogger("sop-agent")
 class ChatIn(BaseModel):
     session_id: str = Field(..., min_length=1, max_length=100)
     message: str = Field(..., min_length=1, max_length=2000)
+    channel: Literal["text", "voice"] = "text"
+    heard: str | None = Field(None, max_length=2000)  # reply text the caller heard before cutting in
 
 
 class ResetIn(BaseModel):
@@ -64,17 +68,34 @@ def _session(session_id: str, create: bool = True) -> tuple[Session, threading.L
         return sessions[session_id], locks[session_id]
 
 
-def _llm(api_key: str | None):
+def _provider() -> str:
     if os.environ.get("SOP_LLM") == "fake":
+        return "fake"
+    return os.environ.get("CLAIMS_PROVIDER", "anthropic").strip().lower() or "anthropic"
+
+
+def _llm(api_key: str | None):
+    provider = _provider()
+    if provider == "fake":
         return FakeLLM()
-    key = (api_key or "").strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if provider not in ("anthropic", "openai"):
+        raise HTTPException(500, "CLAIMS_PROVIDER must be anthropic, openai or fake.")
+    env = "OPENAI_API_KEY" if provider == "openai" else "ANTHROPIC_API_KEY"
+    key = (api_key or "").strip() or os.environ.get(env, "").strip()
     if not key:
         raise HTTPException(
             401,
-            "No API key. Paste an Anthropic API key into the UI, send it as the X-API-Key "
-            "header, or set ANTHROPIC_API_KEY before starting the server.",
+            f"No API key. Paste a {provider} API key into the UI, send it as the X-API-Key "
+            f"header, or set {env} before starting the server.",
         )
-    return AnthropicLLM(key)
+    try:
+        return OpenAILLM(key) if provider == "openai" else AnthropicLLM(key)
+    except ConfigError as e:
+        raise HTTPException(500, str(e))
+
+
+# llm.ProviderError wraps SDK errors (agent H); imported defensively until it exists.
+_ProviderError = getattr(llm_mod, "ProviderError", None) or type("_NoProviderError", (Exception,), {})
 
 
 @app.post("/api/chat")
@@ -84,12 +105,20 @@ def chat(body: ChatIn, x_api_key: str | None = Header(default=None)):
     with lock:
         before = copy.deepcopy(s)
         try:
-            return agent.handle(s, body.message.strip(), llm)
+            return agent.handle(s, body.message.strip(), llm, channel=body.channel, heard=body.heard)
         except anthropic.APIError as e:
             sessions[body.session_id] = before  # a failed turn leaves no trace
             if isinstance(e, anthropic.AuthenticationError):
                 raise HTTPException(401, "The API key was rejected by the model provider.")
             if isinstance(e, anthropic.RateLimitError):
+                raise HTTPException(429, "The model provider is rate limiting requests. Try again shortly.")
+            raise HTTPException(502, f"Model provider error ({type(e).__name__}). Please resend.")
+        except _ProviderError as e:
+            sessions[body.session_id] = before
+            status = getattr(e, "status", 502)
+            if status == 401:
+                raise HTTPException(401, "The API key was rejected by the model provider.")
+            if status == 429:
                 raise HTTPException(429, "The model provider is rate limiting requests. Try again shortly.")
             raise HTTPException(502, f"Model provider error ({type(e).__name__}). Please resend.")
         except Exception:
@@ -119,10 +148,14 @@ def get_outbox(session_id: str):
 
 @app.get("/api/config")
 def config():
+    provider = _provider()
+    key_env = "OPENAI_API_KEY" if provider == "openai" else "ANTHROPIC_API_KEY"
     return {
-        "server_has_key": bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()),
-        "fake_llm": os.environ.get("SOP_LLM") == "fake",
-        "model": os.environ.get("SOP_MODEL") or DEFAULT_MODEL,
+        "server_has_key": bool(os.environ.get(key_env, "").strip()),
+        "fake_llm": provider == "fake",
+        "provider": provider,
+        **(model_names(provider) if provider != "fake" else {}),
+        "effort": os.environ.get("CLAIMS_EFFORT", "").strip() or "medium",
         "today": store.today.isoformat(),
     }
 

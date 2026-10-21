@@ -24,6 +24,20 @@ Rules:
 - done: the caller signals they're finished ("that's all", "nothing else", "I'm good").
 - lacks_document: the caller says they don't have, can't get, or lost a document their claim needs.
 - question: restate the caller's actual question briefly, if there is one.
+
+EMOTION READINGS (fill emotions for the CURRENT CALLER MESSAGE only):
+Read the caller's words and behavior, not the agent's turns. Use earlier caller turns only as context. Give all five readings: frustration, anger, anxiety, confusion, refusal. Each has level none, mild or strong, and words (the caller's own words that show it, quoted exactly; empty when none). Several can be true at once.
+Levels (tie-breaker test, ours, built on published scales):
+- none: no sign of the emotion can be inferred from the caller's words (SemEval-2018 wording).
+- mild: the emotion is clear ("somewhat", Liscombe 2005) and the caller still answers the agent's questions.
+- strong: the emotion is high ("very", Liscombe 2005), or the caller stops answering, or insults the agent (EmoWOZ "Abusive").
+Definitions:
+- frustration: annoyance at the process or at repeating themselves ("I already told you", "this is ridiculous"). GoEmotions treats annoyance as "Mild anger, irritation."
+- anger: GoEmotions anger is "A strong feeling of displeasure or antagonism." Insults and swearing at the agent are strong.
+- anxiety: GoEmotions nervousness is "Apprehension, worry, anxiety." Worry about money, a deadline or the claim outcome counts.
+- confusion: GoEmotions confusion is "Lack of understanding, uncertainty." Mild is a turn that can be paraphrased as "What did you say/mean?" (DAMSL Signal-non-understanding). Strong is confusion that stops the caller from answering.
+- refusal: the caller declines a request (ISO 24617-2 DeclineRequest). Mild is stalling or declining one detail while offering another, or asking why it is needed (DAMSL Reject-part). Strong is declining to continue at all.
+A plain "no" to a yes/no question is not a refusal.
 {claims_block}"""
 
 CLAIMS_BLOCK = """
@@ -83,10 +97,23 @@ PHASE_RULES = {
 }
 
 
-def responder_system(phase: Phase, instructions: list[str], data: dict[str, Any]) -> str:
+def _known_block(known: dict[str, Any] | None) -> str:
+    if not known:
+        return ""
+    lines = [f'- {k}: {v["value"]} (caller said: "{v["words"]}")' for k, v in known.items()]
+    return (
+        "\n\nKNOWN SO FAR (from earlier in this call; do not ask for these again):\n"
+        + "\n".join(lines)
+    )
+
+
+def responder_system(
+    phase: Phase, instructions: list[str], data: dict[str, Any], known: dict[str, Any] | None = None
+) -> str:
     plan = "\n".join(f"- {i}" for i in instructions) or "- Respond helpfully within the phase rules."
     return (
         f"{PERSONA}\n\n{PHASE_RULES[phase]}\n\n"
         f"TURN PLAN (do all of these, in order):\n{plan}\n\n"
         f"ALLOWED DATA:\n{json.dumps(data, indent=1, default=str)}"
+        f"{_known_block(known)}"
     )

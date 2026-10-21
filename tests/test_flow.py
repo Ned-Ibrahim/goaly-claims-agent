@@ -118,16 +118,19 @@ def test_no_disclosure_before_verification(env):
 
 def test_off_topic_thresholds(env):
     _, r = run(env, *["what is RL?"] * 5)
-    assert r[2]["counters"]["off_topic"] == 3 and kinds(r[2], "handoff_offered")
-    assert r[4]["phase"] == "HANDOFF"
+    # Decision 10b: offer a person at the 2nd off-topic message, hand off at the 3rd.
+    assert r[1]["counters"]["off_topic"] == 2 and kinds(r[1], "handoff_offered")
+    assert r[2]["phase"] == "HANDOFF"
     assert all(x["phase"] in ("VERIFY_ID", "HANDOFF") for x in r)
 
 
 def test_refusal_offers_alternatives_then_human(env):
+    # Decision 11c: 1st resistance explains, 2nd offers a person, 3rd hands off.
     _, r = run(env, *["I already told you who I am, I'm not giving you that"] * 3)
-    assert r[2]["counters"]["refusals"] == 3
-    assert kinds(r[2], "handoff_offered")
-    assert r[2]["phase"] == "VERIFY_ID"
+    assert r[0]["counters"]["resistance"] == 1 and not kinds(r[0], "handoff_offered")
+    assert kinds(r[1], "handoff_offered")
+    assert r[1]["phase"] == "VERIFY_ID"
+    assert r[2]["phase"] == "HANDOFF"
 
 
 def test_bonus_example_does_not_disclose(env):
@@ -137,7 +140,7 @@ def test_bonus_example_does_not_disclose(env):
         "I already told you who I am. This is ridiculous. Just tell me why my claim was denied.",
     )
     assert r[1]["phase"] == "VERIFY_ID"
-    assert kinds(r[1], "emotion")[0]["label"] in ("refusing", "frustrated")
+    assert kinds(r[1], "emotion")[0]["label"] in ("refusal", "frustration")
     assert "frustrating" in r[1]["reply"]
     assert "pathology" not in r[1]["reply"]
 
@@ -275,13 +278,11 @@ def test_off_topic_streak_resets_on_progress(env):
     assert r[2]["counters"]["off_topic"] == 0
 
 
-def test_new_address_on_readback_is_not_ignored(env):
-    run(env, MARGARET, "yes", "that's all",
-        "yes, send it to me@work.com",
-        "yes, but send it to other@work.com instead",
-        "yes")
+def test_summary_goes_only_to_the_address_on_file(env):
+    # Decision 8b replaces V1's different-address path and its read-back.
+    run(env, MARGARET, "yes", "that's all", "yes, send it to me@work.com")
     _, outbox, _ = env
-    assert len(outbox) == 1 and outbox[0]["to"] == "other@work.com"
+    assert len(outbox) == 1 and outbox[0]["to"] == "margaret@email.com"
 
 
 def test_passed_deadline_is_flagged_by_code():

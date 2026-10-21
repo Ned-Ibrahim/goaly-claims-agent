@@ -141,16 +141,52 @@ def snapshot(session: Session) -> dict[str, dict]:
     return {k: v.as_dict() for k, v in session.memory.items()}
 
 
-# ---- V2 contracts (stubs; agent F fills these in) ------------------------------
+# ---- V2 contracts --------------------------------------------------------------
+
+# Slots the reply model may see, and what must hold first. Identity slots ("id.*") and
+# email_address are never rendered. Slots hold no verified status, phase or permissions.
+_USABLE_WHEN_VERIFIED = (
+    "intent", "claim_type", "claim_month", "claim_year",
+    "claim_status_hint", "claim_id_hint", "deferred_question",
+)
+_PERSON_SLOTS = ("deferred_question",)
+
+
+def _usable(s: Session, slot: str) -> bool:
+    return slot in _USABLE_WHEN_VERIFIED and s.verified
 
 
 def known_so_far(s: Session) -> dict[str, Any]:
-    return snapshot(s)
+    """Only the slots usable now, as {slot: {"value", "words"}}."""
+    return {
+        k: {"value": v.value, "words": v.quote}
+        for k, v in s.memory.items()
+        if _usable(s, k)
+    }
 
 
 def recent_turns(s: Session, n: int = 4) -> list[dict[str, str]]:
-    return list(s.transcript[s.window_start:])
+    """Last n masked entries of the current person's conversation, starting with a user turn."""
+    turns = list(s.transcript[s.window_start:])[-n:]
+    while turns and turns[0]["role"] != "user":
+        turns.pop(0)
+    return turns
 
 
 def clear_person(s: Session, keep_claim_id: str | None = None) -> None:
-    raise NotImplementedError("agent F")
+    """Switch of person: forget the old caller, keep the failure count."""
+    s.identity.clear()
+    s.identity_attempted = None
+    s.verified = False
+    s.customer_id = None
+    s.matched_fields = []
+    s.memory.clear()
+    s.proposed_claim_id = None
+    s.selected_claim_id = None
+    s.path = None
+    s.pending = None
+    s.readback_fields = []
+    s.memory_hints_used = False
+    s.window_start = len(s.transcript)
+    if keep_claim_id:
+        _put(s, "claim_id_hint", keep_claim_id.strip().upper(), "[claim the caller asked for]")

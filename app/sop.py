@@ -10,25 +10,28 @@ data the current phase does not allow.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
-from . import guidelines, memory
+from . import consent, emotion, guidelines, memory, trace
 from .deadlines import appeal_deadline_state, days_until_deadline
 from .emailer import compose_summary
 from .models import (
+    EMOTIONS,
     MAX_VERIFY_FAILURES,
     OFF_TOPIC_HANDOFF,
     OFF_TOPIC_OFFER_HUMAN,
     PATHS,
     PII_FIELDS,
-    REFUSALS_HANDOFF,
-    REFUSALS_OFFER_HUMAN,
+    RESISTANCE_HANDOFF,
+    RESISTANCE_OFFER_HUMAN,
     Extraction,
     Phase,
     Session,
 )
-from .store import DataStore
+from .store import MONEY_FIELDS, DataStore, norm_dob
 
 # Off by default: per-attempt match counts would tell a caller how many details were right.
 DEBUG_TRACE = os.environ.get("SOP_DEBUG_TRACE") == "1"
@@ -107,8 +110,8 @@ PATH_INSTRUCTIONS = {
         "again. Offer to explain how to send them."
     ),
     "claim_status": (
-        "Tell them the claim's current status in plain words (use status and summary) and the "
-        "amounts that matter to them (amount_meanings says what each money field means)."
+        "Tell them the claim's current status in plain words (use status and summary). Give "
+        "amounts only if ALLOWED DATA has them (amount_meanings says what each money field means)."
     ),
     "appeal_steps": (
         "Explain how to get this decision reviewed again, using only ALLOWED DATA: send the "
@@ -122,6 +125,61 @@ PATH_INSTRUCTIONS = {
         "documents, say so."
     ),
 }
+
+
+READBACK_FIELDS = ("id_last4", "dob", "phone", "email")
+READBACK_PLACEHOLDERS = {
+    "id_last4": "[ID last 4 given]",
+    "dob": "[DOB given]",
+    "phone": "[phone given]",
+    "email": "[email given]",
+}
+
+
+def _digit_words(v: str) -> str:
+    return ", ".join(re.sub(r"\D", "", v)[-4:])
+
+
+def _spoken(field: str, value: str) -> str:
+    """One identity value as the voice should say it: digits one by one, dates in words."""
+    if field == "id_last4":
+        return f"ID ending {_digit_words(value)}"
+    if field == "phone":
+        return f"phone ending {_digit_words(value)}"
+    if field == "dob":
+        try:
+            d = datetime.strptime(norm_dob(value), "%Y-%m-%d")
+            return f"birth date {d.strftime('%B')} {d.day}, {d.year}"
+        except ValueError:
+            return "the birth date you gave"
+    local, _, domain = value.partition("@")
+    return f"email {local} at {domain.replace('.', ' dot ')}"
+
+
+# Decision 9c: the reply model gets only the claim fields the answer needs. Money, the policy
+# number and deadlines are added only when the caller's words ask for them.
+CLAIM_BASE_FIELDS = ("case_id", "case_type", "status", "summary", "created_at")
+PATH_CLAIM_FIELDS = {
+    "claim_status": (),
+    "denial_explanation": ("denial_reason", "documents_needed", "appeal_deadline"),
+    "appeal_steps": ("documents_needed", "appeal_deadline"),
+    "documents_needed": ("documents_needed", "appeal_deadline"),
+}
+ASK_FIELDS = (
+    (re.compile(r"amount|\$|pay|paid|cost|fee|reimburs|money|owe|how much|cover", re.I), MONEY_FIELDS),
+    (re.compile(r"deadline|appeal|due|by when|how long", re.I), ("appeal_deadline", "documents_needed")),
+    (re.compile(r"document|report|note|send|submit|proof", re.I), ("documents_needed",)),
+    (re.compile(r"deni|reason|why", re.I), ("denial_reason",)),
+)
+POLICY_ASK_RE = re.compile(r"policy", re.I)
+
+
+def _claim_fields(path: str | None, asked: str) -> tuple[str, ...]:
+    out = list(CLAIM_BASE_FIELDS) + list(PATH_CLAIM_FIELDS.get(path or "", ()))
+    for pattern, extra in ASK_FIELDS:
+        if pattern.search(asked):
+            out += [f for f in extra if f not in out]
+    return tuple(out)
 
 
 def _last_caller_text(s: Session) -> str:
@@ -141,6 +199,7 @@ class SOPController:
     @staticmethod
     def ev(s: Session, type_: str, **kw: Any) -> None:
         s.turn_events.append({"type": type_, **kw})
+        trace.write(s, s.turn_events[-1])
 
     def transition(self, s: Session, to: Phase) -> None:
         self.ev(s, "transition", **{"from": s.phase.value, "to": to.value})
@@ -151,12 +210,16 @@ class SOPController:
     # ---- entry point -----------------------------------------------------
 
     def step(self, s: Session, ex: Extraction) -> Plan:
+        emotion.record(s, ex)
         if s.phase in (Phase.HANDOFF, Phase.ENDED):
             return Plan(s.phase, static_reply=FALLBACKS[s.phase])
 
         p = Plan(s.phase)
-        self._emotion(s, ex, p)
+        self._log_emotion(s, ex)
+        for line in emotion.tone_lines(ex):
+            p.say(line)
 
+        offered_before = s.pending == "handoff_offer"
         if ex.wants_human or (s.pending == "handoff_offer" and ex.yes_no == "yes"):
             return self.handoff(s, "caller_request", p)
         if s.pending == "handoff_offer" and ex.yes_no == "no":
@@ -177,13 +240,10 @@ class SOPController:
                 "and why in one sentence, then offer what you can do."
             )
 
-        if (
-            s.phase == Phase.VERIFY_ID
-            and (ex.refuses_identity or ex.forbidden_action)
-            and s.counters["refusals"] + 1 >= REFUSALS_HANDOFF
-        ):
-            s.counters["refusals"] += 1
-            return self.handoff(s, "repeated_refusal", p)
+        start = s.phase
+        resist = self._resist(s, ex, p, offered_before)
+        if isinstance(resist, Plan):
+            return resist
 
         handler = {
             Phase.VERIFY_ID: self.verify,
@@ -191,22 +251,79 @@ class SOPController:
             Phase.PROCESS_CASE: self.process,
             Phase.POST_PROCESS: self.post,
         }[s.phase]
-        return handler(s, ex, p)
+        plan = handler(s, ex, p)
+        if PHASE_ORDER.get(plan.phase, -1) > PHASE_ORDER.get(start, -1):
+            s.counters["resistance"] = 0  # real progress resets the streak
+        elif resist and plan.phase == start and not plan.closing:
+            plan.instructions[:0] = resist  # the step is still pending: persuade first
+        return plan
 
     # ---- cross-cutting ---------------------------------------------------
 
-    def _emotion(self, s: Session, ex: Extraction, p: Plan) -> None:
-        label = "refusing" if ex.refuses_identity and s.phase == Phase.VERIFY_ID else ex.emotion
-        self.ev(s, "emotion", label=label)
-        if ex.emotion in ("frustrated", "angry"):
-            p.say(
-                "The caller is upset. Open with one sincere sentence acknowledging how they feel "
-                "(in your own words, no stock phrases), then continue calmly. Do not argue."
+    def _log_emotion(self, s: Session, ex: Extraction) -> None:
+        """Trace event: the strongest reading by name, plus every non-none reading with words."""
+        seen = {
+            name: {"level": r.level, "words": r.words}
+            for name in EMOTIONS
+            if (r := getattr(ex.emotions, name)).level != "none"
+        }
+        top = max(seen, key=lambda n: seen[n]["level"] == "strong", default=None)
+        self.ev(s, "emotion", label=top or "neutral", readings=seen)
+
+    @staticmethod
+    def _required_step(s: Session) -> str | None:
+        """The SOP step the caller may resist: identity, or a representative's consent."""
+        if s.phase == Phase.VERIFY_ID:
+            return "identity"
+        if s.caller_role == "representative" and s.consent_status == "pending":
+            return "consent"
+        return None
+
+    def _resist(self, s: Session, ex: Extraction, p: Plan, offered_before: bool) -> Plan | list[str] | None:
+        """Decision 11c ladder: explain and offer, then offer a person, then hand off.
+
+        Returns the handoff Plan, or the persuasion lines to put ahead of the step's own
+        lines, or None. The gate itself is never loosened here.
+        """
+        step_name = self._required_step(s)
+        pushing = (
+            emotion.resisting(ex)
+            or ex.emotions.anger.level != "none"
+            or (step_name == "identity" and ex.forbidden_action)
+        )
+        if step_name is None or not pushing:
+            return None
+        n = s.counters["resistance"] = s.counters.get("resistance", 0) + 1
+        self.ev(s, "resistance", step=step_name, count=n)
+        if n >= RESISTANCE_HANDOFF or (offered_before and ex.emotions.anger.level == "strong"):
+            return self.handoff(s, "repeated_resistance", p)
+
+        if step_name == "identity":
+            why = (
+                "Explain in one sentence that claim details are protected and verification keeps "
+                "their information safe. Offer the allowed options: any three of the five details "
+                "work, so they can skip one they don't want to share; they can type the details "
+                "instead of saying them; or they can speak with a human representative."
             )
-        elif ex.emotion == "anxious":
-            p.say("The caller sounds worried. Open with brief reassurance, then continue.")
-        elif ex.emotion == "confused":
-            p.say("The caller sounds confused. Explain simply, one step at a time.")
+        else:
+            why = (
+                "Explain in one sentence that the policyholder must approve before anyone else "
+                "hears about their claim, which protects the policyholder. Offer the options: wait "
+                "for the approval, or speak with a human representative."
+            )
+        lines = [
+            "The caller is pushing back on a required step. After one sentence acknowledging how "
+            "they feel, " + why[0].lower() + why[1:] + " Do not disclose any claim detail and "
+            "do not skip the step."
+        ]
+        if n >= RESISTANCE_OFFER_HUMAN or emotion.frustration_shown(s):
+            s.pending = "handoff_offer"
+            self.ev(s, "handoff_offered", reason="resistance")
+            lines.append(
+                "Stop persuading. Offer to connect them with a human representative, and ask "
+                "directly whether they'd like that."
+            )
+        return lines
 
     def _off_topic(self, s: Session, p: Plan) -> Plan:
         s.counters["off_topic"] += 1
@@ -238,16 +355,38 @@ class SOPController:
             return "ask what else they'd like to know about their claim."
         return "ask whether they'd like the email summary sent or skipped."
 
-    def handoff(self, s: Session, reason: str, p: Plan) -> Plan:
-        s.handoff_packet = {
+    @staticmethod
+    def _packet(s: Session, reason: str) -> dict[str, Any]:
+        """Decision 11d. Field names and the caller's words only, never identity values."""
+        known = Extraction(**{f: s.identity[f] for f in PII_FIELDS if s.identity.get(f)})
+        readings = []
+        for entry in s.emotion_log:
+            seen = {
+                name: {"level": r["level"], "words": memory.redact(r.get("words") or "", known, "VERIFY_ID")}
+                for name, r in entry.get("readings", {}).items()
+                if r.get("level", "none") != "none"
+            }
+            if seen:
+                readings.append({"turn": entry["turn"], "readings": seen})
+        return {
             "reason": reason,
             "verified": s.verified,
             "customer_id": s.customer_id if s.verified else None,
+            "matched_fields": list(s.matched_fields),
             "phase_at_handoff": s.phase.value,
-            "memory": memory.snapshot(s),
+            "memory": {k: v for k, v in memory.snapshot(s).items() if not k.startswith("id.")},
             "claims_discussed": list(s.case.claims_discussed),
             "counters": dict(s.counters),
+            "emotions": readings,
+            "caller_role": s.caller_role,
+            "rep_name": s.rep_name,
+            "rep_relationship": s.rep_relationship,
+            "consent_status": s.consent_status,
+            "consent_claim_id": s.consent_claim_id,
         }
+
+    def handoff(self, s: Session, reason: str, p: Plan) -> Plan:
+        s.handoff_packet = self._packet(s, reason)
         s.pending = None
         self.ev(s, "handoff", reason=reason)
         self.transition(s, Phase.HANDOFF)
@@ -264,6 +403,13 @@ class SOPController:
     # ---- VERIFY_ID (strict) -----------------------------------------------
 
     def verify(self, s: Session, ex: Extraction, p: Plan) -> Plan:
+        readback = self._readback(s, ex, p)
+        if readback is not None:
+            return readback
+        if ex.calling_for_other or s.caller_role == "representative":
+            early = self._rep_intake(s, ex, p)  # step 8: caller acts for the policyholder
+            if early is not None:
+                return early
         given = [f for f in PII_FIELDS if s.identity.get(f)]
         p.data = {
             "identity_fields_received": [FIELD_LABELS[f] for f in given],
@@ -280,6 +426,8 @@ class SOPController:
                 detail += f" [debug: {len(r.matched)} match, {r.mismatched} conflict]"
             self.ev(s, "gate", name="identity_verified", passed=r.verified, detail=detail)
             if r.verified:
+                if s.caller_role == "representative":
+                    return self._rep_gate(s, ex, p, r)
                 s.verified = True
                 s.customer_id = r.customer_id
                 s.matched_fields = r.matched
@@ -326,29 +474,59 @@ class SOPController:
             )
         return p
 
-    def _verify_coaching(self, s: Session, ex: Extraction, p: Plan) -> None:
-        """Lines for a turn that stays in VERIFY_ID: refusals, pressure, questions, noted hints."""
-        if ex.refuses_identity or ex.forbidden_action:
-            # Pushback and pressure share one persuasion budget.
-            s.counters["refusals"] += 1
-            n = s.counters["refusals"]
-            if n >= REFUSALS_HANDOFF:
-                p.say("The caller has refused repeatedly; stop persuading.")
-                return
-            p.say(
-                "The caller is pushing back on verification. Explain in one sentence that claim "
-                "details are protected and verification keeps their information safe. Offer "
-                "alternatives: any three of the five details work, so they can skip one they don't "
-                "want to share, or they can speak with a human representative."
-            )
-            if n >= REFUSALS_OFFER_HUMAN:
-                s.pending = "handoff_offer"
-                self.ev(s, "handoff_offered", reason="repeated_refusal")
-                p.say(
-                    "Stop persuading. Ask directly whether they'd like to be connected with a "
-                    "human representative instead."
-                )
+    # ---- read-back of voice-captured details (7a) -----------------------------
 
+    def _readback(self, s: Session, ex: Extraction, p: Plan) -> Plan | None:
+        """Read voice-captured details back before the check; None means carry on to the check."""
+        fresh = [f for f in READBACK_FIELDS if getattr(ex, f)] if s.channel == "voice" else []
+        if s.pending == "readback":
+            if ex.yes_no == "yes" and not fresh:
+                s.pending, s.readback_fields = None, []
+                self.ev(s, "gate", name="readback", passed=True, detail="caller confirmed")
+                return None
+            if ex.yes_no == "no":
+                # A no is a mishearing, not a failed check: drop exactly those details.
+                for f in s.readback_fields:
+                    if f not in fresh:
+                        s.identity.pop(f, None)
+                        s.memory.pop(f"id.{f}", None)
+                s.identity_attempted = None
+                s.readback_fields = []
+                s.pending = None
+                self.ev(s, "gate", name="readback", passed=False, detail="caller said no")
+                if not fresh:
+                    p.say(
+                        "The caller said a detail was heard wrong. Apologise briefly, say it "
+                        "doesn't count against them, and ask for the details again."
+                    )
+                    return None
+            else:
+                fresh = [f for f in READBACK_FIELDS if f in s.readback_fields or f in fresh]
+        if not fresh:
+            return None
+        s.readback_fields, s.pending = fresh, "readback"
+        self.ev(s, "gate", name="readback", passed=None, detail="read back before the check")
+        p.phase = Phase.VERIFY_ID
+        p.static_reply = self._readback_line(s, fresh, masked=False)
+        p.transcript_text = self._readback_line(s, fresh, masked=True)
+        return p
+
+    @staticmethod
+    def _readback_line(s: Session, fields: list[str], masked: bool) -> str:
+        parts = []
+        for f in fields:
+            if masked:
+                parts.append(READBACK_PLACEHOLDERS[f])
+            else:
+                parts.append(_spoken(f, s.identity.get(f, "")))
+        if len(parts) > 1:
+            heard = ", ".join(parts[:-1]) + " and " + parts[-1]
+        else:
+            heard = parts[0]
+        return f"I heard {heard}. Is that right?"
+
+    def _verify_coaching(self, s: Session, ex: Extraction, p: Plan) -> None:
+        """Lines for a turn that stays in VERIFY_ID: questions and noted hints (resistance is step())."""
         if ex.asks_about_process:
             p.say(
                 "First answer their question about the process: we confirm identity before "
@@ -405,12 +583,20 @@ class SOPController:
     def resolve(self, s: Session, ex: Extraction, p: Plan, just_verified: bool = False,
                 after_back_edge: bool = False) -> Plan:
         p.phase = Phase.RESOLVE_INTENT
+        if s.caller_role == "representative":
+            return self._rep_resolve(s, ex, p, just_verified)
         first = self.store.first_name(s.customer_id)
         self.ev(s, "tool_call", name="list_claims")
         claims = self.store.list_claims(s.customer_id)
         p.data = {"caller_first_name": first, "claims_on_file": claims}
         if just_verified:
             p.say(f"Identity is now verified. Briefly thank {first} and say they're verified.")
+
+        # 0. Answer to the offer to verify as another claim's owner (6c).
+        if s.pending == "switch_offer":
+            answered = self._switch_answer(s, ex, p)
+            if answered is not None:
+                return answered
 
         # 1. Answer to a proposed claim.
         if s.pending == "claim_confirm" and s.proposed_claim_id:
@@ -432,13 +618,7 @@ class SOPController:
                 if just_verified:  # named before verification: confirm before using it
                     return self._propose(s, p, claim_id.upper(), from_memory=True)
                 return self._select(s, ex, p, claim_id.upper())
-            p.data["caller_mentioned_claim_id"] = claim_id.upper()
-            p.say(
-                f"There is no claim {claim_id.upper()} on this caller's account. Say you couldn't "
-                "find it on their account (never say whether it exists elsewhere) and ask them to "
-                "check the number or describe the claim."
-            )
-            return p
+            return self._other_claim(s, p)
 
         # 3. Match on hints (this turn's, else the ones remembered from earlier phases).
         hints = self._hints(s, ex, use_memory=not after_back_edge)
@@ -470,6 +650,42 @@ class SOPController:
             "Ask what they'd like help with today. You may briefly mention the claims on file."
         )
         return p
+
+    # ---- a claim that is not the verified caller's (6c) ---------------------------
+
+    def _other_claim(self, s: Session, p: Plan) -> Plan:
+        """Never confirm or deny the claim exists or whose it is; offer once, or hand off."""
+        if emotion.frustration_shown(s) or s.counters.get("switch_offers", 0) >= 1:
+            return self.handoff(s, "other_identity_claim", p)
+        s.counters["switch_offers"] = 1
+        s.pending = "switch_offer"
+        p.say(
+            "The caller asked about a claim you can't discuss under their verified identity. Do "
+            "NOT say whether that claim exists or whose it is, and say nothing about it. Offer "
+            "the caller two choices: verify again as the person that claim belongs to, or be "
+            "connected with a human representative. Ask which they prefer."
+        )
+        return p
+
+    def _switch_answer(self, s: Session, ex: Extraction, p: Plan) -> Plan | None:
+        """The caller's choice after the offer; None when they moved on (the offer is spent)."""
+        claim = s.memory.get("claim_id_hint")
+        claim_id = claim.value if claim is not None else None
+        if ex.switch_choice == "human":
+            return self.handoff(s, "other_identity_claim", p)
+        if ex.switch_choice == "verify" and claim_id:
+            self.ev(s, "gate", name="person_switch", passed=True, detail="verify as another person")
+            memory.clear_person(s, keep_claim_id=claim_id)  # failure count stays (7d)
+            self.transition(s, Phase.VERIFY_ID)
+            p.phase = Phase.VERIFY_ID
+            p.data = {"identity_fields_received": [], "policy_number_received": False}
+            p.say(
+                "Tell the caller you'll verify them as the person they named. Ask for any three "
+                f"of: {_labels(PII_FIELDS)}. Do not say anything about the claim."
+            )
+            return p
+        s.pending = None
+        return None
 
     def _propose(self, s: Session, p: Plan, claim_id: str, from_memory: bool) -> Plan:
         s.pending, s.proposed_claim_id = "claim_confirm", claim_id
@@ -526,18 +742,22 @@ class SOPController:
         claim = self.store.get_claim(s.customer_id, s.selected_claim_id)
         self.ev(s, "gate", name="claim_ownership", passed=claim is not None, detail=s.selected_claim_id)
         today = self.store.today
-        p.data = {
-            "claim": claim,
-            "policy_number": self.store.policy_number(s.customer_id),
-            "amount_meanings": self.store.amount_meanings(),
-            "as_of_date": today.isoformat(),
-        }
+        asked = " ".join(
+            [_last_caller_text(s), ex.question or "", getattr(s.memory.get("deferred_question"), "value", "")]
+        )
+        fields = _claim_fields(s.path, asked)
+        p.data = {"claim": {k: claim[k] for k in fields if claim.get(k) not in (None, "", [])},
+                  "as_of_date": today.isoformat()}
+        if "net_pay" in fields:
+            p.data["amount_meanings"] = self.store.amount_meanings()
+        if POLICY_ASK_RE.search(asked):
+            p.data["policy_number"] = self.store.policy_number(s.customer_id)
         g = self.store.guideline
-        if claim.get("documents_needed"):
+        if claim.get("documents_needed") and "documents_needed" in fields:
             self.ev(s, "tool_call", name="get_document_guidance")
             p.data["document_guidance"] = guidelines.document_guidance(g, claim)
 
-        deadline = appeal_deadline_state(claim, today)
+        deadline = appeal_deadline_state(claim, today) if "appeal_deadline" in fields else None
         if deadline:
             p.data["appeal_deadline_state"] = deadline
             if deadline == "open":
@@ -556,6 +776,8 @@ class SOPController:
 
         if entering or path_changed:
             p.say(PATH_INSTRUCTIONS[s.path])
+            if s.path == "claim_status" and "net_pay" not in fields:
+                p.say("Do not mention any amounts unless the caller asks; none are in ALLOWED DATA.")
             if deadline == "open" and s.path != "claim_status":
                 p.say(
                     "Mention the appeal deadline (appeal_deadline) and how many days are left "
@@ -604,42 +826,35 @@ class SOPController:
             "claims_discussed": s.case.claims_discussed,
             "email_on_file_masked": memory.mask("email", on_file),
         }
+        rep = s.caller_role == "representative"
+        where = (
+            "the email on the policyholder's file (masked form), not the caller's own address; "
+            "say it goes to the policyholder's file"
+            if rep else "their email on file (use the masked form)"
+        )
         if entering:
             s.pending = "email_consent"
             p.say(
                 "Wrap up the case in one short sentence. Then offer to email a summary (what was "
-                "discussed, the claim status, and next steps) to their email on file (use the "
-                "masked form). Make clear it's their choice: send it or skip it."
+                f"discussed, the claim status, and next steps) to {where}. "
+                "Make clear it's their choice: send it or skip it."
             )
             return p
 
         if ex.other_claim or ex.claim_id:
-            s.pending, s.email_to = None, None
+            s.pending = None
             self.transition(s, Phase.RESOLVE_INTENT)
             return self.resolve(s, ex, p, after_back_edge=True)
 
-        if s.pending == "email_address_confirm":
-            new_addr = (ex.email_address_for_summary or "").strip().lower()
-            if new_addr and new_addr != s.email_to:
-                s.email_to = new_addr
-                p.data["requested_address"] = new_addr
-                p.say("They gave a different address. Read back the new address and ask them to confirm it before you send.")
-                return p
-            if ex.yes_no == "yes":
-                return self._send_and_close(s, p, s.email_to)
-            if ex.yes_no == "no":
-                s.pending, s.email_to = "email_consent", None
-                p.say("Ask whether to send it to the email on file instead, or skip it.")
-                return p
+        # Decision 8b: the summary goes only to the email on the policyholder's file.
+        if ex.email_address_for_summary:
+            p.say(
+                "They gave another address. Say plainly that the summary can only go to the "
+                "email on the policyholder's file (masked form), never to a different address."
+            )
 
         if s.pending == "email_consent":
             if ex.yes_no == "yes":
-                other = ex.email_address_for_summary
-                if other and other.strip().lower() != on_file.lower():
-                    s.pending, s.email_to = "email_address_confirm", other.strip().lower()
-                    p.data["requested_address"] = s.email_to
-                    p.say("Read back the address they gave and ask them to confirm it before you send.")
-                    return p
                 return self._send_and_close(s, p, on_file)
             if ex.yes_no == "no":
                 self.ev(s, "gate", name="email_consent", passed=False, detail="caller declined; nothing sent")
@@ -666,7 +881,166 @@ class SOPController:
         s.pending = None
         self.transition(s, Phase.ENDED)
         p.closing = True
-        p.fallback_text = f"Done: I've sent the summary to {masked}. Thanks for calling, and take care."
+        owner = "the policyholder's email on file" if s.caller_role == "representative" else "your email on file"
+        p.fallback_text = f"Done: I've sent the summary to {owner}, {masked}. Thanks for calling, and take care."
         p.data["email_sent_to"] = masked
-        p.say("Confirm the summary was sent to that address (masked form), thank them, and close the call warmly.")
+        p.say(
+            "Confirm the summary was sent to the email on the policyholder's file (masked form)"
+            + (", and tell the representative it went there" if s.caller_role == "representative" else "")
+            + ", thank them, and close the call warmly."
+        )
+        return p
+
+    # ---- representative and consent (step 8) -----------------------------------
+
+    def _rep_intake(self, s: Session, ex: Extraction, p: Plan) -> Plan | None:
+        """Record who is calling for the policyholder; the 3-of-5 check runs on the policyholder."""
+        if ex.calling_for_other and s.caller_role != "representative":
+            s.caller_role = "representative"
+            self.ev(s, "gate", name="caller_role", passed=True, detail="representative")
+        if ex.rep_name:
+            s.rep_name = ex.rep_name.strip()
+        if ex.relationship:
+            s.rep_relationship = ex.relationship.strip().lower()
+        if s.rep_name and ex.full_name and consent.same_name(ex.full_name, s.rep_name):
+            # The caller's own name is not an identity detail of the policyholder.
+            s.identity.pop("full_name", None)
+            s.memory.pop("id.full_name", None)
+        p.say(
+            "The caller is acting for someone else. The identity details to check are the "
+            "policyholder's, not the caller's own. Do not say anything about the policyholder's "
+            "account or claims."
+        )
+        if s.pending == "rep_identify":
+            r = self.store.verify_identity(s.identity)
+            if r.verified and s.rep_name and s.rep_relationship:
+                return self._rep_gate(s, ex, p, r)
+        if not (s.rep_name and s.rep_relationship):
+            p.say(
+                "Also ask for the caller's own name and how they are related to the policyholder."
+            )
+        return None
+
+    def _rep_gate(self, s: Session, ex: Extraction, p: Plan, r) -> Plan:
+        """Gate 2 (8a, 8d): the caller must be on the representative list for this policyholder."""
+        p.data = {"caller_role": "representative"}
+        if not (s.rep_name and s.rep_relationship):
+            s.pending = "rep_identify"
+            self.ev(s, "gate", name="representative_listed", passed=False, detail="name or relationship missing")
+            p.say(
+                "Ask for the caller's own name and how they are related to the policyholder. "
+                "Do not say whether the details matched or anything about the account."
+            )
+            return p
+        listed = consent.is_listed(
+            self.store.representatives_for(r.customer_id), s.rep_name, s.rep_relationship
+        )
+        self.ev(s, "gate", name="representative_listed", passed=listed, detail="checked against the list on file")
+        if not listed:
+            self.handoff(s, "unlisted_representative", p)
+            p.say(
+                "Say you can only discuss a policy with the policyholder or someone already on "
+                "file for them, and that the person you are connecting them with can help add "
+                "them. Disclose nothing about the policyholder or any claims, and do not say "
+                "whether a policy or claims exist."
+            )
+            return p
+        s.verified, s.customer_id, s.matched_fields = True, r.customer_id, r.matched
+        s.pending = None
+        memory.forget_id_digits(s)
+        self.transition(s, Phase.RESOLVE_INTENT)
+        p.phase = Phase.RESOLVE_INTENT
+        return self.resolve(s, ex, p, just_verified=True)
+
+    def _rep_claim(self, s: Session, ex: Extraction, just_verified: bool) -> tuple[str | None, bool]:
+        """The one claim the caller points at, found without telling them anything: (id, named)."""
+        slot = s.memory.get("claim_id_hint")
+        claim_id = ex.claim_id or (slot.value if just_verified and slot is not None else None)
+        if claim_id:
+            owned = self.store.get_claim(s.customer_id, claim_id) is not None
+            self.ev(s, "gate", name="claim_ownership", passed=owned, detail=claim_id.upper())
+            return (claim_id.upper() if owned else None), True
+        hints = self._hints(s, ex, use_memory=True)
+        if hints:
+            s.memory_hints_used = True
+            found = self._match(self.store.list_claims(s.customer_id), hints)
+            if len(found) == 1:
+                return found[0]["case_id"], False
+        return None, False
+
+    def _rep_resolve(self, s: Session, ex: Extraction, p: Plan, just_verified: bool) -> Plan:
+        """A representative sees no claim list and no claim fact until the policyholder approves it."""
+        p.data = {"caller_role": "representative", "representative_name": s.rep_name}
+        if just_verified:
+            p.say(
+                "The caller is confirmed as someone on file for the policyholder. Thank them. "
+                "Do not mention any claim, how many exist, or any status or amount."
+            )
+        if s.consent_status == "pending":
+            return self._rep_wait(s, ex, p)
+        claim_id, named = self._rep_claim(s, ex, just_verified)
+        if claim_id is None:
+            if s.consent_status == "timeout" and not (ex.claim_id or ex.other_claim):
+                p.say(
+                    "The policyholder's approval did not come back. Disclose nothing and offer a "
+                    "human representative."
+                )
+                s.pending = "handoff_offer"
+            else:
+                p.say(
+                    "Ask which claim number the caller wants to discuss. Do not list claims or say "
+                    "whether any exist, and give no claim details."
+                )
+            return p
+        if s.consent_status == "approved" and s.consent_claim_id == claim_id:
+            return self._select(s, ex, p, claim_id)
+        return self._rep_request(s, ex, p, claim_id, named)
+
+    def _rep_request(self, s: Session, ex: Extraction, p: Plan, claim_id: str, named: bool) -> Plan:
+        """8e: one request per claim, naming it. Consent lasts for this call only."""
+        s.consent_claim_id, s.consent_status, s.consent_checks = claim_id, "pending", 0
+        s.selected_claim_id, s.path = None, None
+        self.ev(
+            s, "tool_call", name="request_consent",
+            detail=f"{s.rep_relationship} {s.rep_name} asks to discuss {claim_id}",
+        )
+        return self._rep_poll(s, ex, p, named)
+
+    def _rep_wait(self, s: Session, ex: Extraction, p: Plan) -> Plan:
+        named = bool(ex.claim_id and ex.claim_id.upper() == s.consent_claim_id)
+        if ex.claim_id and not named:
+            p.say("A different claim was named. Say the first approval is still pending and it can follow.")
+        return self._rep_poll(s, ex, p, named)
+
+    def _rep_poll(self, s: Session, ex: Extraction, p: Plan, named: bool) -> Plan:
+        """One consent check per caller turn (8c): approved, still pending, or timed out."""
+        status = consent.consent_status(consent.scenario_name(), s.consent_checks)
+        s.consent_checks += 1
+        self.ev(s, "tool_call", name="check_consent", detail=f"check {s.consent_checks}")
+        if status == "approved":
+            s.consent_status = "approved"
+            self.ev(s, "gate", name="consent", passed=True, detail=s.consent_claim_id)
+            p.say("The policyholder has approved this for this claim. Say so in one short sentence.")
+            return self._select(s, ex, p, s.consent_claim_id)
+        if s.consent_checks >= consent.CONSENT_TIMEOUT_CHECKS:
+            s.consent_status = "timeout"
+            s.pending = "handoff_offer"
+            self.ev(s, "gate", name="consent", passed=False, detail="timeout")
+            self.ev(s, "handoff_offered", reason="consent_timeout")
+            p.data = {"caller_role": "representative"}
+            p.say(
+                "The approval request timed out: the policyholder has not answered. Say you "
+                "cannot share anything without it, disclose nothing about any claim, and ask "
+                "whether they would like a human representative."
+            )
+            return p
+        p.data = {"caller_role": "representative", "representative_name": s.rep_name}
+        if named:
+            p.data["claim_id_requested"] = s.consent_claim_id
+        p.say(
+            "You have asked the policyholder to approve this caller discussing the claim"
+            + (f" {s.consent_claim_id}" if named else " they described")
+            + ", and you are waiting on the policyholder's answer. Say only that. Give no claim "
+            "status, amount, date or other claim detail."
+        )
         return p

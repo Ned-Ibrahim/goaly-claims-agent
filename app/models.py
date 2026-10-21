@@ -28,10 +28,10 @@ PATHS = ("claim_status", "denial_explanation", "appeal_steps", "documents_needed
 
 # Thresholds (documented in the README).
 MAX_VERIFY_FAILURES = 3
-OFF_TOPIC_OFFER_HUMAN = 3
-OFF_TOPIC_HANDOFF = 5
-REFUSALS_OFFER_HUMAN = 3
-REFUSALS_HANDOFF = 5
+OFF_TOPIC_OFFER_HUMAN = 2  # decision 10b
+OFF_TOPIC_HANDOFF = 3
+RESISTANCE_OFFER_HUMAN = 2  # decision 11c: same numbers as off-topic
+RESISTANCE_HANDOFF = 3
 
 
 Intent = Literal[
@@ -138,6 +138,26 @@ class Extraction(BaseModel):
     )
     question: str | None = Field(
         None, description="The caller's actual question in this message, restated briefly, if any."
+    )
+    # Representative callers (decision 8a). full_name stays the policyholder's name.
+    calling_for_other: bool = Field(
+        False, description="Caller says they are calling for someone else (a family member, etc.)."
+    )
+    rep_name: str | None = Field(
+        None, description="The caller's OWN full name when they are acting for someone else."
+    )
+    relationship: str | None = Field(
+        None,
+        description="The caller's relationship to the policyholder from the caller's side "
+        "(e.g. 'son' when calling for their mother, 'neighbor'), if stated.",
+    )
+    switch_choice: Literal["verify", "human", "none"] = Field(
+        "none",
+        description=(
+            "Only when the agent offered to verify as the owner of another claim or connect a "
+            "person: 'verify' if the caller chooses to verify as that person, 'human' if they "
+            "choose a person, otherwise none."
+        ),
     )
 
 

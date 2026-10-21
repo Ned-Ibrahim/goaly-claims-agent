@@ -33,12 +33,22 @@ STATUS_WORDS = {
 }
 
 
-def compose_summary(store: DataStore, s: Session, to: str) -> dict:
+def compose_summary(store: DataStore, s: Session, to: str | None = None) -> dict:
+    """Decision 8b: the summary goes only to the email on the policyholder's file.
+
+    `to` is accepted for callers that pass it, but any other address is ignored.
+    """
+    to = store.customer(s.customer_id)["email"]
     first = store.first_name(s.customer_id)
+    rep = s.caller_role == "representative"
     claims = [store.get_claim(s.customer_id, cid) for cid in s.case.claims_discussed]
     claims = [c for c in claims if c]
 
-    discussed = ["We verified your identity."]
+    if rep:
+        who = f"{s.rep_name}, your {s.rep_relationship}," if s.rep_name and s.rep_relationship else "Someone on file for you"
+        discussed = [f"{who} called about your claim, and you approved it."]
+    else:
+        discussed = ["We verified your identity."]
     topics = ", ".join(PATH_TOPICS[p] for p in s.case.paths_taken if p in PATH_TOPICS)
     for c in claims:
         line = f"Claim {c['case_id']}: {c['summary']} (opened {c['created_at']})"
@@ -74,9 +84,13 @@ def compose_summary(store: DataStore, s: Session, to: str) -> dict:
     def bullets(items: list[str]) -> str:
         return "\n".join(f"- {i}" for i in items)
 
+    intro = (
+        "Here is a summary of today's call with claims support about your claim."
+        if rep else "Here is a summary of your call with claims support today."
+    )
     body = (
         f"Hi {first},\n\n"
-        "Here is a summary of your call with claims support today.\n\n"
+        f"{intro}\n\n"
         f"What we discussed\n{bullets(discussed)}\n\n"
         f"Claim status\n{bullets(status_lines) if status_lines else '- No claim was reviewed.'}\n\n"
         f"Next steps\n{bullets(next_steps)}\n\n"
