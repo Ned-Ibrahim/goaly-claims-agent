@@ -2,7 +2,8 @@
 
 Callers prove who they are with a date of birth, ID last four, phone, email and name, and the model provider (whichever key the reviewer brings) is outside our control.
 We decided code parses identity details out of each message before any model call, keeps them in a server-side store, and gives the model only placeholders such as `[DOB given]`. Verification runs in code and takes no values from the model.
-An egress check blocks any stored value, and the matched record's name and aliases, in every prompt, reply and API response. An in-process Presidio detector is a second line for formats the parser misses, and a typed field is the fallback when a spoken value cannot be read.
+An exact-match egress check blocks any stored value in every prompt, reply and API response.
+The name is the one Identity detail the model does see: it reads the name to verify it and uses the first name to address the caller (option A in the design notes). An in-process Presidio detector is a second line for formats the parser misses, and a typed field is the fallback when a spoken value cannot be read.
 
 ## Considered Options
 
