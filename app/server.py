@@ -91,7 +91,7 @@ def _llm(api_key: str | None):
     if not key:
         raise HTTPException(
             401,
-            f"No API key. Paste a {provider} API key into the UI, send it as the X-API-Key "
+            f"No API key. Paste {'an OpenAI' if provider == 'openai' else 'an Anthropic'} API key into the UI, send it as the X-API-Key "
             f"header, or set {env} before starting the server.",
         )
     try:
