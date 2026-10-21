@@ -129,6 +129,7 @@ function describe(e) {
     case "memory_write": return `memory ← ${e.slot}`;
     case "scope": return `scope: ${e.in_scope ? "in scope" : `OUT OF SCOPE (#${e.count})`}`;
     case "emotion": return `emotion: ${e.label}`;
+    case "resistance": return `resisted ${e.step} step (#${e.count})`;
     case "path": return `workflow path: ${e.name}`;
     case "email_sent": return `email sent to ${e.to}`;
     case "handoff_offered": return `offered human (${e.reason})`;
