@@ -139,3 +139,18 @@ def month_number(name: str | None) -> int | None:
 
 def snapshot(session: Session) -> dict[str, dict]:
     return {k: v.as_dict() for k, v in session.memory.items()}
+
+
+# ---- V2 contracts (stubs; agent F fills these in) ------------------------------
+
+
+def known_so_far(s: Session) -> dict[str, Any]:
+    return snapshot(s)
+
+
+def recent_turns(s: Session, n: int = 4) -> list[dict[str, str]]:
+    return list(s.transcript[s.window_start:])
+
+
+def clear_person(s: Session, keep_claim_id: str | None = None) -> None:
+    raise NotImplementedError("agent F")
